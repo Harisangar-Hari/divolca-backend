@@ -1,0 +1,321 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model CashLedgerEntries {
+  Id          String   @id(map: "PK_CashLedgerEntries") @db.Uuid
+  Date        DateTime @db.Timestamptz(6)
+  Type        String
+  Amount      Decimal  @db.Decimal
+  Category    String
+  ReferenceId String?
+  Description String
+  CreatedAt   DateTime @db.Timestamptz(6)
+}
+
+model SalePayments {
+  Id          String   @id(map: "PK_SalePayments") @db.Uuid
+  SaleId      String   @db.Uuid
+  PaymentMode String // 'cash', 'card', 'credit', 'bank_transfer'
+  Amount      Decimal  @db.Decimal
+  Status      String // 'pending', 'completed', 'failed', 'refunded'
+  Reference   String? // Transaction reference
+  PaidAt      DateTime @db.Timestamptz(6)
+  CreatedAt   DateTime @default(now()) @db.Timestamptz(6)
+  Sales       Sales    @relation(fields: [SaleId], references: [Id], onDelete: Cascade)
+
+  @@index([SaleId])
+}
+
+model Categories {
+  Id       String     @id(map: "PK_Categories") @db.Uuid
+  Name     String
+  Products Products[]
+}
+
+model Categories2 {
+  Id       String @id(map: "PK_Categories2") @db.Uuid
+  Name     String
+  Category String
+}
+
+model CreditPayments {
+  Id     String   @id(map: "PK_CreditPayments") @db.Uuid
+  SaleId String   @db.Uuid
+  Amount Decimal  @db.Decimal
+  PaidAt DateTime @db.Timestamptz(6)
+  Note   String?
+  Sales  Sales    @relation(fields: [SaleId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_CreditPayments_Sales_SaleId")
+
+  @@index([SaleId], map: "IX_CreditPayments_SaleId")
+}
+
+model CustomerLedgerEntries {
+  Id           String       @id(map: "PK_CustomerLedgerEntries") @db.Uuid
+  CustomerId   String       @db.Uuid
+  SaleId       String?      @db.Uuid
+  SaleReturnId String?      @db.Uuid
+  Credit       Decimal      @db.Decimal
+  Debit        Decimal      @db.Decimal
+  Type         String
+  CreatedAt    DateTime     @db.Timestamptz(6)
+  Customers    Customers    @relation(fields: [CustomerId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_CustomerLedgerEntries_Customers_CustomerId")
+  SaleReturns  SaleReturns? @relation(fields: [SaleReturnId], references: [Id], onDelete: NoAction, onUpdate: NoAction, map: "FK_CustomerLedgerEntries_SaleReturns_SaleReturnId")
+  Sales        Sales?       @relation(fields: [SaleId], references: [Id], onDelete: NoAction, onUpdate: NoAction, map: "FK_CustomerLedgerEntries_Sales_SaleId")
+
+  @@index([CustomerId], map: "IX_CustomerLedgerEntries_CustomerId")
+  @@index([SaleId], map: "IX_CustomerLedgerEntries_SaleId")
+  @@index([SaleReturnId], map: "IX_CustomerLedgerEntries_SaleReturnId")
+}
+
+model Customers {
+  Id                    String                  @id(map: "PK_Customers") @db.Uuid
+  Name                  String
+  Phone                 String
+  Email                 String?                 @unique
+  Address               String?                 // Full address
+  DeliveryAddress       String?                 // Separate delivery address
+  BillingAddress        String?                 // Separate billing address
+  City                  String?
+  State                 String?
+  PostalCode            String?
+  Country               String?                 @default("Bangladesh")
+  
+  // Additional contact info
+  AlternativePhone      String?
+  Fax                   String?
+  Website               String?
+  
+  // Credit Specific Fields
+  CreditLimit           Decimal?                @default(0.0) @db.Decimal
+  CreditBalance         Decimal                 @default(0.0) @db.Decimal
+  AvailableCredit       Decimal?                @default(0.0) @db.Decimal
+  
+  // Customer Details
+  CompanyName           String?
+  TaxNumber             String?                 // TIN/VAT/GST
+  CustomerType          CustomerType            @default(RETAIL)
+  
+  // Status & Management
+  IsActive              Boolean                 @default(true)
+  IsBlocked             Boolean                 @default(false)
+  BlockReason           String?
+  CreditRiskScore       Int?                    // 1-10 rating
+  PaymentTerms          String?                 // "Net 30", "Due on receipt"
+  Notes                 String?
+  
+  // Timestamps
+  CreatedAt             DateTime                @db.Timestamptz(6)
+  UpdatedAt             DateTime?                @updatedAt @db.Timestamptz(6)
+  LastPurchaseDate      DateTime?
+  LastPaymentDate       DateTime?
+  
+  // Existing fields
+  LoyaltyPoints         Int                     @default(0)
+  LoyaltyTier           String                  @default("")
+  TotalSpent            Decimal                 @default(0.0) @db.Decimal
+  
+  // Relations
+  CustomerLedgerEntries CustomerLedgerEntries[]
+  Sales                 Sales[]
+}
+
+// Add enum for customer type
+enum CustomerType {
+  RETAIL
+  WHOLESALE
+  CORPORATE
+  VIP
+  GOVERNMENT
+  EDUCATIONAL
+}
+
+model Expenses {
+  Id          String   @id(map: "PK_Expenses") @db.Uuid
+  Title       String
+  Amount      Decimal  @db.Decimal
+  Category    String
+  ExpenseDate DateTime @db.Timestamptz(6)
+  Notes       String?
+}
+
+model Brands {
+  Id        String     @id(map: "PK_Brands") @db.Uuid
+  Name      String
+  IsActive  Boolean    @default(true)
+  CreatedAt DateTime   @db.Timestamptz(6)
+  Products  Products[]
+}
+
+model Products {
+  Id              String            @id(map: "PK_Products") @db.Uuid
+  Name            String
+  Barcode         String
+  SKU             String            @default("")
+  Description     String?
+  Price           Decimal           @db.Decimal
+  CostPrice       Decimal           @db.Decimal
+  Discount        Decimal           @default(0.0) @db.Decimal
+  StockQty        Int
+  ReorderLevel    Int               @default(0)
+  Unit            String            @default("pcs")
+  IsActive        Boolean
+  WarrantyMonths  Int?              @default(0)
+  ImageUrl        String?
+  CategoryId      String            @db.Uuid
+  BrandId         String?           @db.Uuid
+  Categories      Categories        @relation(fields: [CategoryId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_Products_Categories_CategoryId")
+  Brands          Brands?           @relation(fields: [BrandId], references: [Id], onDelete: SetNull, onUpdate: NoAction, map: "FK_Products_Brands_BrandId")
+  PurchaseItems   PurchaseItems[]
+  SaleItems       SaleItems[]
+  SaleReturnItems SaleReturnItems[]
+
+  @@index([CategoryId], map: "IX_Products_CategoryId")
+  @@index([BrandId], map: "IX_Products_BrandId")
+}
+
+model PurchaseItems {
+  Id         String    @id(map: "PK_PurchaseItems") @db.Uuid
+  PurchaseId String    @db.Uuid
+  ProductId  String    @db.Uuid
+  Quantity   Int
+  CostPrice  Decimal   @db.Decimal
+  Products   Products  @relation(fields: [ProductId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_PurchaseItems_Products_ProductId")
+  Purchases  Purchases @relation(fields: [PurchaseId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_PurchaseItems_Purchases_PurchaseId")
+
+  @@index([ProductId], map: "IX_PurchaseItems_ProductId")
+  @@index([PurchaseId], map: "IX_PurchaseItems_PurchaseId")
+}
+
+model Purchases {
+  Id               String             @id(map: "PK_Purchases") @db.Uuid
+  PurchaseNumber   String?             @unique 
+  InvoiceNumber    String
+  PurchaseDate     DateTime           @db.Timestamptz(6)
+  GrandTotal       Decimal            @db.Decimal
+  SupplierId       String             @default(dbgenerated("'00000000-0000-0000-0000-000000000000'::uuid")) @db.Uuid
+  BalanceAmount    Decimal            @default(0.0) @db.Decimal
+  PaidAmount       Decimal            @default(0.0) @db.Decimal
+  PurchaseItems    PurchaseItems[]
+  Suppliers        Suppliers          @relation(fields: [SupplierId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_Purchases_Suppliers_SupplierId")
+  SupplierPayments SupplierPayments[]
+
+  @@index([SupplierId], map: "IX_Purchases_SupplierId")
+}
+
+model SaleItems {
+  Id        String   @id(map: "PK_SaleItems") @db.Uuid
+  SaleId    String   @db.Uuid
+  ProductId String   @db.Uuid
+  Quantity  Int
+  UnitPrice Decimal  @db.Decimal
+  Total     Decimal  @db.Decimal
+  Discount  Decimal  @default(0.0) @db.Decimal
+  Products  Products @relation(fields: [ProductId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_SaleItems_Products_ProductId")
+  Sales     Sales    @relation(fields: [SaleId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_SaleItems_Sales_SaleId")
+
+  @@index([ProductId], map: "IX_SaleItems_ProductId")
+  @@index([SaleId], map: "IX_SaleItems_SaleId")
+}
+
+model SaleReturnItems {
+  Id           String      @id(map: "PK_SaleReturnItems") @db.Uuid
+  SaleReturnId String      @db.Uuid
+  ProductId    String      @db.Uuid
+  Quantity     Int
+  UnitPrice    Decimal     @db.Decimal
+  Reason       String?
+  Products     Products    @relation(fields: [ProductId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_SaleReturnItems_Products_ProductId")
+  SaleReturns  SaleReturns @relation(fields: [SaleReturnId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_SaleReturnItems_SaleReturns_SaleReturnId")
+
+  @@index([ProductId], map: "IX_SaleReturnItems_ProductId")
+  @@index([SaleReturnId], map: "IX_SaleReturnItems_SaleReturnId")
+}
+
+model SaleReturns {
+  Id                    String                  @id(map: "PK_SaleReturns") @db.Uuid
+  SaleId                String                  @db.Uuid
+  ReturnedAt            DateTime                @db.Timestamptz(6)
+  Reason                String
+  IsCreditAdjustment    Boolean                 @default(false)
+  RefundAmount          Decimal                 @default(0.0) @db.Decimal
+  RefundMethod          String?
+  ReturnAmount          Decimal                 @default(0.0) @db.Decimal
+  CustomerLedgerEntries CustomerLedgerEntries[]
+  SaleReturnItems       SaleReturnItems[]
+  Sales                 Sales                   @relation(fields: [SaleId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_SaleReturns_Sales_SaleId")
+
+  @@index([SaleId], map: "IX_SaleReturns_SaleId")
+}
+
+model Sales {
+  Id                    String                  @id(map: "PK_Sales") @db.Uuid
+  InvoiceNumber         String
+  TotalAmount           Decimal                 @db.Decimal
+  CreatedAt             DateTime                @db.Timestamptz(6)
+  Status                Int                     @default(0)
+  BalanceAmount         Decimal                 @default(0.0) @db.Decimal
+  CustomerId            String?                 @db.Uuid
+  IsCreditSale          Boolean                 @default(false)
+  paymentMode           String                  @default("cash")
+  PaidAmount            Decimal                 @default(0.0) @db.Decimal
+  HasReturns            Boolean                 @default(false)
+  ReturnedAmount        Decimal                 @default(0.0) @db.Decimal
+  InvoiceDiscount       Decimal                 @default(0.0) @db.Decimal
+  SubTotal              Decimal                 @default(0.0) @db.Decimal
+  CreditPayments        CreditPayments[]
+  CustomerLedgerEntries CustomerLedgerEntries[]
+  SaleItems             SaleItems[]
+  SaleReturns           SaleReturns[]
+  SalePayments          SalePayments[]
+  Customers             Customers?              @relation(fields: [CustomerId], references: [Id], onDelete: NoAction, onUpdate: NoAction, map: "FK_Sales_Customers_CustomerId")
+
+  @@index([CustomerId], map: "IX_Sales_CustomerId")
+}
+
+model SupplierPayments {
+  Id               String    @id(map: "PK_SupplierPayments") @db.Uuid
+  PurchaseId       String    @db.Uuid
+  Amount           Decimal   @db.Decimal
+  PaymentMethod    String
+  PaidAt           DateTime  @db.Timestamptz(6)
+  Status           String?
+  CashLedgerPosted Boolean   @default(false)
+  ClearedAt        DateTime? @db.Timestamptz(6)
+  ChequeNumber     String?
+  ChequeDate       DateTime? @db.Timestamptz(6)
+  Notes            String?
+  Purchases        Purchases @relation(fields: [PurchaseId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_SupplierPayments_Purchases_PurchaseId")
+
+  @@index([PurchaseId], map: "IX_SupplierPayments_PurchaseId")
+}
+
+model Suppliers {
+  Id        String      @id(map: "PK_Suppliers") @db.Uuid
+  Name      String
+  Phone     String
+  Email     String?
+  Address   String?
+  CreatedAt DateTime    @db.Timestamptz(6)
+  Purchases Purchases[]
+}
+
+model Users {
+  Id           String   @id(map: "PK_Users") @db.Uuid
+  Username     String
+  PasswordHash String
+  Role         String
+  CreatedAt    DateTime @db.Timestamptz(6)
+}
+
+model EFMigrationsHistory {
+  MigrationId    String @id(map: "PK___EFMigrationsHistory") @db.VarChar(150)
+  ProductVersion String @db.VarChar(32)
+
+  @@map("__EFMigrationsHistory")
+}
