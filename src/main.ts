@@ -19,8 +19,8 @@ async function bootstrap() {
     origin: [
       'http://localhost:5173',
       'http://localhost:5174',
-      'https://pos-billing-five.vercel.app',
-      'https://pos-admin-delta.vercel.app'
+      'https://divolca-pos.vercel.app',
+      'https://divolca-admin.vercel.app'
     ],
 
     methods: [
