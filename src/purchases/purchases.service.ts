@@ -86,7 +86,9 @@ export class PurchasesService {
                     PurchaseDate: dto.purchaseDate ? new Date(dto.purchaseDate) : new Date(),
                     GrandTotal: total,
                     PaidAmount: 0,
+
                     BalanceAmount: total,
+                    Status: 0,
                     PurchaseItems: {
                         create: purchaseItems
                     }
@@ -202,7 +204,7 @@ export class PurchasesService {
 
             PurchaseDate: purchase.PurchaseDate,
 
-
+            Status: purchase.Status,
             supplier: purchase.Suppliers
                 ? {
 
@@ -241,6 +243,81 @@ export class PurchasesService {
 
     }
 
+    async cancelPurchase(purchaseId: string, reason?: string) {
+        return await this.prisma.$transaction(async (tx) => {
+            // 1. Find the purchase
+            const purchase = await tx.purchases.findUnique({
+                where: { Id: purchaseId },
+                include: {
+                    PurchaseItems: {
+                        include: {
+                            Products: true
+                        }
+                    },
+                    Suppliers: true
+                }
+            });
 
+            if (!purchase) {
+                throw new NotFoundException('Purchase not found');
+            }
+
+            // 2. Check if already cancelled
+            if (purchase.Status === 3) { // 3 = CANCELLED
+                throw new BadRequestException('Purchase is already cancelled');
+            }
+
+            // 3. Check if fully paid (if any payments made)
+            if (Number(purchase.PaidAmount) > 0) {
+                throw new BadRequestException('Cannot cancel a purchase that has payments made');
+            }
+
+            // 4. Restore stock quantities (deduct the stock that was added)
+            for (const item of purchase.PurchaseItems) {
+                await tx.products.update({
+                    where: { Id: item.ProductId },
+                    data: {
+                        StockQty: { decrement: item.Quantity },
+                    },
+                });
+            }
+
+            // 5. Update purchase status to CANCELLED
+            const updatedPurchase = await tx.purchases.update({
+                where: { Id: purchase.Id },
+                data: {
+                    Status: 3, // 3 = CANCELLED
+                    BalanceAmount: 0,
+                },
+            });
+
+            return {
+                message: `Purchase ${purchase.InvoiceNumber} cancelled successfully${reason ? ` (${reason})` : ''}`,
+                purchase: {
+                    Id: updatedPurchase.Id,
+                    InvoiceNumber: updatedPurchase.InvoiceNumber,
+                    Status: updatedPurchase.Status,
+                },
+            };
+        }, {
+            timeout: 15000,
+            maxWait: 10000,
+        });
+    }
+
+    // ============================
+    // ✅ CANCEL PURCHASE BY INVOICE NUMBER
+    // ============================
+    async cancelPurchaseByInvoice(invoiceNumber: string, reason?: string) {
+        const purchase = await this.prisma.purchases.findFirst({
+            where: { InvoiceNumber: invoiceNumber },
+        });
+
+        if (!purchase) {
+            throw new NotFoundException(`Purchase with invoice ${invoiceNumber} not found`);
+        }
+
+        return this.cancelPurchase(purchase.Id, reason);
+    }
 
 }

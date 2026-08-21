@@ -4,7 +4,10 @@ import {
     Post,
     Param,
     Body,
-    BadRequestException
+    BadRequestException,
+    HttpStatus,
+    HttpCode,
+    Delete
 } from '@nestjs/common';
 
 import { SalesService } from './sales.service';
@@ -159,6 +162,30 @@ export class SalesController {
 
         return this.salesService.replacement(dto);
 
+    }
+
+     // =========================
+    // ✅ CANCEL SALE INVOICE (NEW)
+    // =========================
+    @Delete('cancel/:id')
+    @HttpCode(HttpStatus.OK)
+    async cancelSale(
+        @Param('id') id: string,
+        @Body() body?: { reason?: string }
+    ) {
+        return this.salesService.cancelSale(id, body?.reason);
+    }
+
+    // =========================
+    // ✅ CANCEL SALE BY INVOICE NUMBER (NEW)
+    // =========================
+    @Delete('cancel/invoice/:invoiceNumber')
+    @HttpCode(HttpStatus.OK)
+    async cancelSaleByInvoice(
+        @Param('invoiceNumber') invoiceNumber: string,
+        @Body() body?: { reason?: string }
+    ) {
+        return this.salesService.cancelSaleByInvoice(invoiceNumber, body?.reason);
     }
 
 

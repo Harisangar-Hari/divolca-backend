@@ -201,6 +201,7 @@ model Purchases {
   SupplierId       String             @default(dbgenerated("'00000000-0000-0000-0000-000000000000'::uuid")) @db.Uuid
   BalanceAmount    Decimal            @default(0.0) @db.Decimal
   PaidAmount       Decimal            @default(0.0) @db.Decimal
+  Status           Int                @default(0)
   PurchaseItems    PurchaseItems[]
   Suppliers        Suppliers          @relation(fields: [SupplierId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_Purchases_Suppliers_SupplierId")
   SupplierPayments SupplierPayments[]

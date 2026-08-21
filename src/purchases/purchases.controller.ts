@@ -3,7 +3,10 @@ import {
     Post,
     Get,
     Body,
-    Param
+    Param,
+    HttpCode,
+    Delete,
+    HttpStatus
 } from '@nestjs/common';
 
 
@@ -51,6 +54,25 @@ export class PurchasesController {
 
         return this.service.findOne(id);
 
+    }
+
+     @Delete('cancel/:id')
+    @HttpCode(HttpStatus.OK)
+    async cancelPurchase(
+        @Param('id') id: string,
+        @Body() body?: { reason?: string }
+    ) {
+        return this.service.cancelPurchase(id, body?.reason);
+    }
+
+    // ✅ Cancel purchase by invoice number
+    @Delete('cancel/invoice/:invoiceNumber')
+    @HttpCode(HttpStatus.OK)
+    async cancelPurchaseByInvoice(
+        @Param('invoiceNumber') invoiceNumber: string,
+        @Body() body?: { reason?: string }
+    ) {
+        return this.service.cancelPurchaseByInvoice(invoiceNumber, body?.reason);
     }
 
 

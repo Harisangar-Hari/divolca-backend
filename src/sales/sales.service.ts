@@ -16,6 +16,7 @@ export enum SaleStatus {
     PARTIALLY_RETURNED = 1,
     FULLY_RETURNED = 2,
     COMPLETED = 3,
+    CANCELLED = 4,
 }
 
 @Injectable()
@@ -924,4 +925,201 @@ export class SalesService {
             };
         });
     }
+
+
+
+    async cancelSale(saleId: string, reason?: string) {
+        return await this.prisma.$transaction(async (tx) => {
+            // 1. Find the sale
+            const sale = await tx.sales.findUnique({
+                where: { Id: saleId },
+                include: {
+                    SaleItems: {
+                        include: {
+                            Products: true,
+                        },
+                    },
+                    Customers: true,
+                    SalePayments: true,
+                    CreditPayments: true,
+                },
+            });
+
+            if (!sale) {
+                throw new NotFoundException('Sale not found');
+            }
+
+            // 2. Check if already cancelled
+            if (sale.Status === 4) { // 4 = CANCELLED
+                throw new BadRequestException('Sale is already cancelled');
+            }
+
+            // 3. Check if already returned
+            if (sale.Status === 2) { // 2 = FULLY_RETURNED
+                throw new BadRequestException('Cannot cancel a returned sale');
+            }
+
+            // 4. Restore stock quantities
+            for (const item of sale.SaleItems) {
+                await tx.products.update({
+                    where: { Id: item.ProductId },
+                    data: {
+                        StockQty: { increment: item.Quantity },
+                    },
+                });
+            }
+
+            // 5. Reverse customer credit balance (if credit sale)
+            if (sale.CustomerId && sale.IsCreditSale) {
+                const currentBalance = Number(sale.Customers?.CreditBalance || 0);
+                const balanceAmount = Number(sale.BalanceAmount || 0);
+
+                // Only reverse if there's a balance
+                if (balanceAmount > 0) {
+                    await tx.customers.update({
+                        where: { Id: sale.CustomerId },
+                        data: {
+                            CreditBalance: { decrement: balanceAmount },
+                            TotalSpent: { decrement: Number(sale.TotalAmount || 0) },
+                            LoyaltyPoints: { decrement: Math.floor(Number(sale.TotalAmount || 0) / 2000) },
+                        },
+                    });
+                } else {
+                    // If fully paid, just reverse total spent and loyalty
+                    await tx.customers.update({
+                        where: { Id: sale.CustomerId },
+                        data: {
+                            TotalSpent: { decrement: Number(sale.TotalAmount || 0) },
+                            LoyaltyPoints: { decrement: Math.floor(Number(sale.TotalAmount || 0) / 2000) },
+                        },
+                    });
+                }
+            }
+
+            // 6. Reverse customer ledger entries
+            if (sale.CustomerId) {
+                // Create reverse ledger entry
+                await tx.customerLedgerEntries.create({
+                    data: {
+                        Id: randomUUID(),
+                        CustomerId: sale.CustomerId,
+                        SaleId: sale.Id,
+                        Debit: 0,
+                        Credit: Number(sale.TotalAmount || 0),
+                        Type: 'CANCELLATION',
+                        CreatedAt: new Date(),
+                    },
+                });
+
+                // Also reverse any existing ledger entries for this sale
+                const existingLedgerEntries = await tx.customerLedgerEntries.findMany({
+                    where: { SaleId: sale.Id },
+                });
+
+                for (const entry of existingLedgerEntries) {
+                    await tx.customerLedgerEntries.create({
+                        data: {
+                            Id: randomUUID(),
+                            CustomerId: sale.CustomerId,
+                            SaleId: sale.Id,
+                            Debit: entry.Credit || 0,
+                            Credit: entry.Debit || 0,
+                            Type: 'CANCELLATION_REVERSAL',
+                            CreatedAt: new Date(),
+                        },
+                    });
+                }
+            }
+
+            // 7. Reverse cash ledger (if cash or card payment)
+            const paidAmount = Number(sale.PaidAmount || 0);
+            if (paidAmount > 0 && (sale.paymentMode === 'cash' || sale.paymentMode === 'card')) {
+                await this.cashLedger.add(
+                    'OUT',
+                    paidAmount,
+                    'CANCELLATION',
+                    sale.InvoiceNumber,
+                    `Cancellation refund for ${sale.InvoiceNumber}${reason ? ` (${reason})` : ''}`
+                );
+            }
+
+            // 8. Reverse credit payments (if any)
+            if (sale.CreditPayments && sale.CreditPayments.length > 0) {
+                for (const payment of sale.CreditPayments) {
+                    // Create reverse entry in credit payments
+                    await tx.creditPayments.create({
+                        data: {
+                            Id: randomUUID(),
+                            SaleId: sale.Id,
+                            Amount: -Number(payment.Amount || 0),
+                            PaidAt: new Date(),
+                            Note: `Cancellation reversal${reason ? `: ${reason}` : ''}`,
+                        },
+                    });
+
+                    // Reverse customer credit balance for the payment
+                    if (sale.CustomerId) {
+                        await tx.customers.update({
+                            where: { Id: sale.CustomerId },
+                            data: {
+                                CreditBalance: { increment: Number(payment.Amount || 0) },
+                            },
+                        });
+                    }
+                }
+            }
+
+            // 9. Reverse sale payments
+            if (sale.SalePayments && sale.SalePayments.length > 0) {
+                for (const payment of sale.SalePayments) {
+                    await tx.salePayments.create({
+                        data: {
+                            Id: randomUUID(),
+                            SaleId: sale.Id,
+                            PaymentMode: payment.PaymentMode,
+                            Amount: -Number(payment.Amount || 0),
+                            PaidAt: new Date(),
+                            Status: 'cancelled',
+                            Reference: `Cancellation of ${payment.Reference || payment.Id}`,
+                        },
+                    });
+                }
+            }
+
+            // 10. Update sale status to CANCELLED
+            const updatedSale = await tx.sales.update({
+                where: { Id: sale.Id },
+                data: {
+                    Status: 4, // 4 = CANCELLED
+                    BalanceAmount: 0,
+                    PaidAmount: 0,
+                    IsCreditSale: false,
+                },
+            });
+
+            return {
+                message: `Sale ${sale.InvoiceNumber} cancelled successfully${reason ? ` (${reason})` : ''}`,
+                sale: updatedSale,
+            };
+        }, {
+            timeout: 30000,
+            maxWait: 15000,
+        });
+    }
+
+    // ============================
+    // ✅ CANCEL SALE BY INVOICE NUMBER (NEW)
+    // ============================
+    async cancelSaleByInvoice(invoiceNumber: string, reason?: string) {
+        const sale = await this.prisma.sales.findFirst({
+            where: { InvoiceNumber: invoiceNumber },
+        });
+
+        if (!sale) {
+            throw new NotFoundException(`Sale with invoice ${invoiceNumber} not found`);
+        }
+
+        return this.cancelSale(sale.Id, reason);
+    }
+
 }
