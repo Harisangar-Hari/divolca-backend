@@ -4,13 +4,19 @@ import {
     Post,
     Body,
     Param,
-    Query
+    Query,
+    Put,
+    Patch,
+    HttpCode,
+    HttpStatus,
+    Delete
 } from '@nestjs/common';
 
 import { CustomersService } from './customers.service';
 
 import { CreateCustomerDto } from './dto/create-customer.dto';
 import { PayCustomerCreditDto } from './dto/pay-customer-credit.dto';
+import { UpdateCustomerDto } from './dto/update-customer.dto';
 
 
 
@@ -35,6 +41,13 @@ export class CustomersController {
 
     }
 
+     @Delete(':id')
+    @HttpCode(HttpStatus.OK)
+    async deleteCustomer(
+        @Param('id') id: string
+    ) {
+        return this.customersService.deleteCustomer(id);
+    }
 
 
     // =========================
@@ -124,6 +137,38 @@ export class CustomersController {
         return this.customersService.getCustomerById(id);
 
     }
+
+      @Put(':id')
+    async updateCustomer(
+        @Param('id') id: string,
+        @Body() dto: UpdateCustomerDto
+    ) {
+        return this.customersService.updateCustomer(id, dto);
+    }
+
+    // =========================
+    // ✅ TOGGLE CUSTOMER STATUS (NEW)
+    // =========================
+    @Patch(':id/toggle-status')
+    @HttpCode(HttpStatus.OK)
+    async toggleCustomerStatus(
+        @Param('id') id: string
+    ) {
+        return this.customersService.toggleCustomerStatus(id);
+    }
+
+    // =========================
+    // ✅ TOGGLE BLOCK CUSTOMER (NEW)
+    // =========================
+    @Patch(':id/toggle-block')
+    @HttpCode(HttpStatus.OK)
+    async toggleBlockCustomer(
+        @Param('id') id: string,
+        @Body() body?: { reason?: string }
+    ) {
+        return this.customersService.toggleBlockCustomer(id, body?.reason);
+    }
+
 
 
 

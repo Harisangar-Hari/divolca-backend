@@ -4,6 +4,7 @@ import { CashLedgerService } from '../cash-ledger/cash-ledger.service';
 import { CreateCustomerDto } from './dto/create-customer.dto';
 import { PayCustomerCreditDto } from './dto/pay-customer-credit.dto';
 import { CustomerType } from '@prisma/client';
+import { UpdateCustomerDto } from './dto/update-customer.dto';
 // enum CustomerType {
 //     RETAIL,
 //     WHOLESALE,
@@ -282,76 +283,81 @@ export class CustomersService {
   // UPDATE CUSTOMER
   // =========================
 
-  async updateCustomer(id: string, dto: CreateCustomerDto) {
-    const customer = await this.prisma.customers.findUnique({
-      where: { Id: id }
-    });
+  async updateCustomer(id: string, dto: UpdateCustomerDto) {
+        const customer = await this.prisma.customers.findUnique({
+            where: { Id: id }
+        });
 
-    if (!customer) {
-      throw new NotFoundException('Customer not found');
-    }
-
-    // Check if phone is being updated and already exists
-    if (dto.Phone && dto.Phone !== customer.Phone) {
-      const existingPhone = await this.prisma.customers.findFirst({
-        where: {
-          Phone: dto.Phone,
-          NOT: { Id: id }
+        if (!customer) {
+            throw new NotFoundException('Customer not found');
         }
-      });
 
-      if (existingPhone) {
-        throw new BadRequestException('Phone number already exists');
-      }
-    }
+        // Check if phone is being updated and already exists
+        if (dto.Phone && dto.Phone !== customer.Phone) {
+            const existingPhone = await this.prisma.customers.findFirst({
+                where: {
+                    Phone: dto.Phone,
+                    NOT: { Id: id }
+                }
+            });
 
-    // Check if email is being updated and already exists
-    if (dto.Email && dto.Email !== customer.Email) {
-      const existingEmail = await this.prisma.customers.findFirst({
-        where: {
-          Email: dto.Email,
-          NOT: { Id: id }
+            if (existingPhone) {
+                throw new BadRequestException('Phone number already exists');
+            }
         }
-      });
 
-      if (existingEmail) {
-        throw new BadRequestException('Email already exists');
-      }
+        // Check if email is being updated and already exists
+        if (dto.Email && dto.Email !== customer.Email) {
+            const existingEmail = await this.prisma.customers.findFirst({
+                where: {
+                    Email: dto.Email,
+                    NOT: { Id: id }
+                }
+            });
+
+            if (existingEmail) {
+                throw new BadRequestException('Email already exists');
+            }
+        }
+
+        const updatedCustomer = await this.prisma.customers.update({
+            where: { Id: id },
+            data: {
+                Name: dto.Name ?? customer.Name,
+                Phone: dto.Phone ?? customer.Phone,
+                Email: dto.Email ?? customer.Email,
+                Address: dto.Address ?? customer.Address,
+                DeliveryAddress: dto.DeliveryAddress ?? customer.DeliveryAddress,
+                BillingAddress: dto.BillingAddress ?? customer.BillingAddress,
+                City: dto.City ?? customer.City,
+                State: dto.State ?? customer.State,
+                PostalCode: dto.PostalCode ?? customer.PostalCode,
+                Country: dto.Country ?? customer.Country,
+                AlternativePhone: dto.AlternativePhone ?? customer.AlternativePhone,
+                CreditLimit: dto.CreditLimit !== undefined ? dto.CreditLimit : customer.CreditLimit,
+                CompanyName: dto.CompanyName ?? customer.CompanyName,
+                TaxNumber: dto.TaxNumber ?? customer.TaxNumber,
+                CustomerType: dto.CustomerType ?? customer.CustomerType,
+                PaymentTerms: dto.PaymentTerms ?? customer.PaymentTerms,
+                Notes: dto.Notes ?? customer.Notes,
+                IsActive: dto.isActive !== undefined ? dto.isActive : customer.IsActive,
+                IsBlocked: dto.isBlocked !== undefined ? dto.isBlocked : customer.IsBlocked,
+            }
+        });
+
+        return {
+            Id: updatedCustomer.Id,
+            Name: updatedCustomer.Name,
+            Phone: updatedCustomer.Phone,
+            Email: updatedCustomer.Email,
+            CustomerType: updatedCustomer.CustomerType,
+            CreditLimit: updatedCustomer.CreditLimit,
+            IsActive: updatedCustomer.IsActive,
+            IsBlocked: updatedCustomer.IsBlocked,
+            UpdatedAt: updatedCustomer.UpdatedAt
+        };
     }
 
-    const updatedCustomer = await this.prisma.customers.update({
-      where: { Id: id },
-      data: {
-        Name: dto.Name || customer.Name,
-        Phone: dto.Phone || customer.Phone,
-        Email: dto.Email || customer.Email,
-        Address: dto.Address || customer.Address,
-        DeliveryAddress: dto.DeliveryAddress || customer.DeliveryAddress,
-        BillingAddress: dto.BillingAddress || customer.BillingAddress,
-        City: dto.City || customer.City,
-        State: dto.State || customer.State,
-        PostalCode: dto.PostalCode || customer.PostalCode,
-        Country: dto.Country || customer.Country,
-        AlternativePhone: dto.AlternativePhone || customer.AlternativePhone,
-        CreditLimit: dto.CreditLimit || customer.CreditLimit,
-        CompanyName: dto.CompanyName || customer.CompanyName,
-        TaxNumber: dto.TaxNumber || customer.TaxNumber,
-        CustomerType: dto.CustomerType || customer.CustomerType,
-        PaymentTerms: dto.PaymentTerms || customer.PaymentTerms,
-        Notes: dto.Notes || customer.Notes
-      }
-    });
-
-    return {
-      Id: updatedCustomer.Id,
-      Name: updatedCustomer.Name,
-      Phone: updatedCustomer.Phone,
-      Email: updatedCustomer.Email,
-      CustomerType: updatedCustomer.CustomerType,
-      CreditLimit: updatedCustomer.CreditLimit,
-      UpdatedAt: updatedCustomer.UpdatedAt
-    };
-  }
 
   // =========================
   // TOGGLE CUSTOMER STATUS
@@ -584,4 +590,61 @@ export class CustomersService {
       }))
     };
   }
+
+
+ async deleteCustomer(id: string) {
+        // 1. Check if customer exists
+        const customer = await this.prisma.customers.findUnique({
+            where: { Id: id },
+            include: {
+                Sales: {
+                    where: {
+                        BalanceAmount: { gt: 0 }
+                    }
+                }
+            }
+        });
+
+        if (!customer) {
+            throw new NotFoundException('Customer not found');
+        }
+
+        // 2. Check if customer has outstanding balance
+        if (customer.Sales.length > 0) {
+            const totalBalance = customer.Sales.reduce(
+                (sum, sale) => sum + Number(sale.BalanceAmount),
+                0
+            );
+            
+            if (totalBalance > 0) {
+                throw new BadRequestException(
+                    `Cannot delete customer with outstanding balance of Rs ${totalBalance.toFixed(2)}. Please clear all dues first.`
+                );
+            }
+        }
+
+        // 3. Check if customer has any sales (even paid ones)
+        const hasSales = await this.prisma.sales.findFirst({
+            where: { CustomerId: id }
+        });
+
+        if (hasSales) {
+            throw new BadRequestException(
+                'Cannot delete customer with existing sales history. You can deactivate the customer instead.'
+            );
+        }
+
+        // 4. Delete customer (soft delete - mark as inactive)
+        // Or actually delete if you prefer
+        await this.prisma.customers.delete({
+            where: { Id: id }
+        });
+
+        return {
+            message: `Customer ${customer.Name} deleted successfully`,
+            id: customer.Id
+        };
+    }
+
+
 }
