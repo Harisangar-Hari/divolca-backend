@@ -582,6 +582,7 @@ export class ReportsService {
             PaymentMode: sale.paymentMode,
             IsCreditSale: sale.IsCreditSale,
             CreatedAt: sale.CreatedAt,
+            CustomerId: sale.CustomerId,
             CustomerName: sale.Customers?.Name || 'Walk-in Customer',
             CustomerPhone: sale.Customers?.Phone || '',
             Items: sale.SaleItems.map((item) => ({

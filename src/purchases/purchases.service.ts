@@ -23,93 +23,95 @@ export class PurchasesService {
 
 
     async create(dto: CreatePurchaseDto) {
-        return await this.prisma.$transaction(async (tx) => {
-            const supplier = await tx.suppliers.findUnique({
-                where: { Id: dto.supplierId }
-            });
-
-            if (!supplier) {
-                throw new BadRequestException("Supplier not found");
-            }
-
-            let total = 0;
-            const purchaseItems: any[] = [];
-
-            // ✅ Generate UUID for the internal Id
-            const purchaseId = randomUUID();
-
-            // ✅ Check if PurchaseNumber exists (if provided)
-            if (dto.purchaseNumber) {
-                const existing = await tx.purchases.findFirst({
-                    where: { PurchaseNumber: dto.purchaseNumber }
-                });
-
-                if (existing) {
-                    throw new BadRequestException(`Purchase Number "${dto.purchaseNumber}" already exists`);
-                }
-            }
-
-            for (const item of dto.items) {
-                const product = await tx.products.findUnique({
-                    where: { Id: item.productId }
-                });
-
-                if (!product) {
-                    throw new BadRequestException("Product not found");
-                }
-
-                await tx.products.update({
-                    where: { Id: item.productId },
-                    data: {
-                        StockQty: { increment: item.quantity },
-                        CostPrice: item.costPrice
-                    }
-                });
-
-                const lineTotal = item.quantity * item.costPrice;
-                total += lineTotal;
-
-                purchaseItems.push({
-                    Id: randomUUID(),
-                    ProductId: item.productId,
-                    Quantity: item.quantity,
-                    CostPrice: item.costPrice
-                });
-            }
-
-            const purchase = await tx.purchases.create({
-                data: {
-                    Id: purchaseId,
-                    PurchaseNumber: dto.purchaseNumber || null, // ✅ Can be null
-                    InvoiceNumber: "PUR-" + Date.now(),
-                    SupplierId: dto.supplierId,
-                    PurchaseDate: dto.purchaseDate ? new Date(dto.purchaseDate) : new Date(),
-                    GrandTotal: total,
-                    PaidAmount: 0,
-
-                    BalanceAmount: total,
-                    Status: 0,
-                    PurchaseItems: {
-                        create: purchaseItems
-                    }
-                },
-                include: {
-                    Suppliers: true
-                }
-            });
-
-            return {
-                Id: purchase.Id,
-                PurchaseNumber: purchase.PurchaseNumber,
-                InvoiceNumber: purchase.InvoiceNumber,
-                GrandTotal: purchase.GrandTotal,
-                PaidAmount: purchase.PaidAmount,
-                BalanceAmount: purchase.BalanceAmount,
-                supplierName: supplier.Name
-            };
+    return await this.prisma.$transaction(async (tx) => {
+        const supplier = await tx.suppliers.findUnique({
+            where: { Id: dto.supplierId }
         });
-    }
 
+        if (!supplier) {
+            throw new BadRequestException("Supplier not found");
+        }
+
+        let total = 0;
+        const purchaseItems: any[] = [];
+
+        // ✅ Generate UUID for the internal Id
+        const purchaseId = randomUUID();
+
+        // ✅ Check if PurchaseNumber exists (if provided)
+        if (dto.purchaseNumber) {
+            const existing = await tx.purchases.findFirst({
+                where: { PurchaseNumber: dto.purchaseNumber }
+            });
+
+            if (existing) {
+                throw new BadRequestException(`Purchase Number "${dto.purchaseNumber}" already exists`);
+            }
+        }
+
+        for (const item of dto.items) {
+            const product = await tx.products.findUnique({
+                where: { Id: item.productId }
+            });
+
+            if (!product) {
+                throw new BadRequestException("Product not found");
+            }
+
+            await tx.products.update({
+                where: { Id: item.productId },
+                data: {
+                    StockQty: { increment: item.quantity },
+                    CostPrice: item.costPrice
+                }
+            });
+
+            const lineTotal = item.quantity * item.costPrice;
+            total += lineTotal;
+
+            purchaseItems.push({
+                Id: randomUUID(),
+                ProductId: item.productId,
+                Quantity: item.quantity,
+                CostPrice: item.costPrice
+            });
+        }
+
+        const purchase = await tx.purchases.create({
+            data: {
+                Id: purchaseId,
+                PurchaseNumber: dto.purchaseNumber || null, // ✅ Can be null
+                InvoiceNumber: "PUR-" + Date.now(),
+                SupplierId: dto.supplierId,
+                PurchaseDate: dto.purchaseDate ? new Date(dto.purchaseDate) : new Date(),
+                GrandTotal: total,
+                PaidAmount: 0,
+
+                BalanceAmount: total,
+                Status: 0,
+                PurchaseItems: {
+                    create: purchaseItems
+                }
+            },
+            include: {
+                Suppliers: true
+            }
+        });
+
+        return {
+            Id: purchase.Id,
+            PurchaseNumber: purchase.PurchaseNumber,
+            InvoiceNumber: purchase.InvoiceNumber,
+            GrandTotal: purchase.GrandTotal,
+            PaidAmount: purchase.PaidAmount,
+            BalanceAmount: purchase.BalanceAmount,
+            supplierName: supplier.Name
+        };
+    }, {
+        timeout: 15000,    // 15 seconds timeout for the transaction
+        maxWait: 10000,    // 10 seconds max wait time
+    });
+}
 
 
 

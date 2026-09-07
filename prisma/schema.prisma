@@ -311,7 +311,13 @@ model Users {
   Username     String
   PasswordHash String
   Role         String
+  IsActive     Boolean  @default(true)
   CreatedAt    DateTime @db.Timestamptz(6)
+  UpdatedAt    DateTime @updatedAt @db.Timestamptz(6) @default(now())
+  LastLogin    DateTime? @db.Timestamptz(6)
+  FullName     String?
+  Email        String?  @unique
+  Permissions  Json?  
 }
 
 model EFMigrationsHistory {

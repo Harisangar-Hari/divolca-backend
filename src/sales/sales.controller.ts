@@ -7,10 +7,12 @@ import {
     BadRequestException,
     HttpStatus,
     HttpCode,
-    Delete
+    Delete,
+    Put
 } from '@nestjs/common';
 
 import { SalesService } from './sales.service';
+import { AddSaleItemDto, EditSaleDto, UpdateSaleItemDto } from './dto/checkout.dto';
 
 
 @Controller('sales')
@@ -164,7 +166,7 @@ export class SalesController {
 
     }
 
-     // =========================
+    // =========================
     // ✅ CANCEL SALE INVOICE (NEW)
     // =========================
     @Delete('cancel/:id')
@@ -189,5 +191,48 @@ export class SalesController {
     }
 
 
+    @Put('edit/:id')
+    @HttpCode(HttpStatus.OK)
+    async editSaleAfterCheckout(
+        @Param('id') id: string,
+        @Body() dto: EditSaleDto
+    ) {
+        return this.salesService.editSaleAfterCheckout(id, dto);
+    }
+
+
+    @Put('item/:saleId/:itemId')
+    @HttpCode(HttpStatus.OK)
+    async updateSaleItem(
+        @Param('saleId') saleId: string,
+        @Param('itemId') itemId: string,
+        @Body() dto: UpdateSaleItemDto
+    ) {
+        return this.salesService.updateSaleItem(saleId, itemId, dto);
+    }
+
+    // =========================
+    // ✅ ADD ITEM TO SALE (NEW)
+    // =========================
+    @Post('item/:saleId')
+    @HttpCode(HttpStatus.CREATED)
+    async addSaleItem(
+        @Param('saleId') saleId: string,
+        @Body() dto: AddSaleItemDto
+    ) {
+        return this.salesService.addSaleItem(saleId, dto);
+    }
+
+    // =========================
+    // ✅ REMOVE ITEM FROM SALE (NEW)
+    // =========================
+    @Delete('item/:saleId/:itemId')
+    @HttpCode(HttpStatus.OK)
+    async removeSaleItem(
+        @Param('saleId') saleId: string,
+        @Param('itemId') itemId: string
+    ) {
+        return this.salesService.removeSaleItem(saleId, itemId);
+    }
 
 }

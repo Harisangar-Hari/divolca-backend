@@ -1,7 +1,7 @@
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CashLedgerService } from '../cash-ledger/cash-ledger.service';
-import { CreateCheckoutDto } from './dto/checkout.dto';
+import { AddSaleItemDto, CreateCheckoutDto, EditSaleDto, UpdateSaleItemDto } from './dto/checkout.dto';
 import { randomUUID } from 'crypto';
 import { CreateSaleReturnDto } from './dto/return-sale.dto';
 
@@ -341,8 +341,8 @@ export class SalesService {
                 };
             },
             {
-                timeout: 15000,
-                maxWait: 5000,
+                timeout: 30000,
+                maxWait: 15000,
             }
         );
     }
@@ -511,13 +511,19 @@ export class SalesService {
     // ============================
     // RETURN ITEMS
     // ============================
+    // src/sales/sales.service.ts - Fixed returnItems
+
     async returnItems(dto: CreateSaleReturnDto) {
         return await this.prisma.$transaction(
             async (tx) => {
                 const sale = await tx.sales.findFirst({
                     where: { InvoiceNumber: dto.invoiceNumber },
                     include: {
-                        SaleItems: true,
+                        SaleItems: {
+                            include: {
+                                Products: true,
+                            },
+                        },
                         SaleReturns: {
                             include: {
                                 SaleReturnItems: true,
@@ -536,7 +542,14 @@ export class SalesService {
                     throw new BadRequestException('Invoice is already fully returned');
                 }
 
+                // ✅ Calculate invoice discount percentage
+                const totalAmount = Number(sale.TotalAmount);
+                const subTotal = Number(sale.SubTotal);
+                const invoiceDiscountAmount = Number(sale.InvoiceDiscount);
+                const discountPercentage = subTotal > 0 ? (invoiceDiscountAmount / subTotal) * 100 : 0;
+
                 let totalRefund = 0;
+                const returnedItemIds: string[] = [];
 
                 // Create Sale Return
                 const saleReturn = await tx.saleReturns.create({
@@ -561,7 +574,7 @@ export class SalesService {
                         );
                     }
 
-                    // Calculate already returned quantity
+                    // ✅ Calculate already returned quantity for this item
                     const alreadyReturned = sale.SaleReturns.reduce(
                         (sum, ret) =>
                             sum +
@@ -571,16 +584,24 @@ export class SalesService {
                         0
                     );
 
-                    const availableQty = saleItem.Quantity - alreadyReturned;
+                    const originalQuantity = saleItem.Quantity;
+                    const availableQty = originalQuantity - alreadyReturned;
 
                     if (item.quantity > availableQty) {
                         throw new BadRequestException(
-                            `Return quantity (${item.quantity}) exceeds available quantity (${availableQty}) for product`
+                            `Return quantity (${item.quantity}) exceeds available quantity (${availableQty}) for product ${item.productId}`
                         );
                     }
 
-                    const refund = Number(saleItem.UnitPrice) * item.quantity;
-                    totalRefund += refund;
+                    // ✅ Calculate refund amount with invoice discount proration
+                    const unitPrice = Number(saleItem.UnitPrice);
+                    const itemSubtotal = unitPrice * item.quantity;
+
+                    // ✅ Apply proportional invoice discount
+                    const itemDiscount = (itemSubtotal * discountPercentage) / 100;
+                    const refundAmount = itemSubtotal - itemDiscount;
+
+                    totalRefund += refundAmount;
 
                     // Restore stock
                     await tx.products.update({
@@ -599,21 +620,48 @@ export class SalesService {
                             Reason: dto.reason,
                         },
                     });
+
+                    // Store the sale item ID for later update
+                    returnedItemIds.push(saleItem.Id);
+
+                    // ✅ UPDATE THE SALE ITEM - Reduce quantity or delete
+                    const remainingQty = originalQuantity - item.quantity - alreadyReturned;
+
+                    if (remainingQty <= 0) {
+                        // Delete the sale item if fully returned
+                        await tx.saleItems.delete({
+                            where: { Id: saleItem.Id },
+                        });
+                    } else {
+                        // Update the sale item with new quantity and total
+                        const newTotal = unitPrice * remainingQty;
+                        await tx.saleItems.update({
+                            where: { Id: saleItem.Id },
+                            data: {
+                                Quantity: remainingQty,
+                                Total: newTotal,
+                            },
+                        });
+                    }
                 }
 
-                // Update return total
+                // ✅ Update return total
                 await tx.saleReturns.update({
                     where: { Id: saleReturn.Id },
                     data: { ReturnAmount: totalRefund },
                 });
 
-                // Update sale
+                // ✅ Update sale
                 const totalReturned = Number(sale.ReturnedAmount ?? 0) + totalRefund;
-                const newPaid = Math.max(0, Number(sale.PaidAmount) - totalRefund);
-                const newBalance = Math.max(0, Number(sale.TotalAmount) - totalReturned);
+                const totalPaid = Number(sale.PaidAmount);
+                const totalAmountValue = Number(sale.TotalAmount);
+
+                // Calculate new paid amount (reduce by refund amount)
+                const newPaid = Math.max(0, totalPaid - totalRefund);
+                const newBalance = Math.max(0, totalAmountValue - totalReturned);
 
                 let status = SaleStatus.PENDING;
-                if (totalReturned >= Number(sale.TotalAmount)) {
+                if (totalReturned >= totalAmountValue) {
                     status = SaleStatus.FULLY_RETURNED;
                 } else if (totalReturned > 0) {
                     status = SaleStatus.PARTIALLY_RETURNED;
@@ -627,6 +675,15 @@ export class SalesService {
                         PaidAmount: newPaid,
                         BalanceAmount: newBalance,
                         Status: status,
+                        // ✅ Update total amount to reflect remaining value
+                        TotalAmount: totalAmountValue - totalReturned,
+                        // ✅ Update SubTotal to reflect remaining value
+                        SubTotal: subTotal - (totalRefund / (1 - discountPercentage / 100)),
+                        // ✅ Update InvoiceDiscount to reflect remaining discount
+                        InvoiceDiscount: (subTotal - (totalRefund / (1 - discountPercentage / 100))) * (discountPercentage / 100),
+                        ...(status === SaleStatus.FULLY_RETURNED && {
+                            IsCreditSale: false,
+                        }),
                     },
                 });
 
@@ -646,9 +703,8 @@ export class SalesService {
                         },
                     });
 
-                    // UPDATE CUSTOMER'S CREDIT BALANCE (DECREASE IT)
-                    // Only if the customer exists and the sale was a credit sale or had balance
-                    if (sale.Customers && sale.IsCreditSale) {
+                    // ✅ UPDATE CUSTOMER'S CREDIT BALANCE
+                    if (sale.Customers) {
                         const currentBalance = Number(sale.Customers.CreditBalance) || 0;
                         const refundAmount = Math.min(totalRefund, currentBalance);
 
@@ -664,7 +720,7 @@ export class SalesService {
                     }
                 }
 
-                // Cash refund
+                // Cash refund (only if customer paid cash/card)
                 const cashRefund = Math.min(totalRefund, Number(sale.PaidAmount));
                 if (cashRefund > 0) {
                     await this.cashLedger.add(
@@ -691,11 +747,29 @@ export class SalesService {
                     },
                 }) : null;
 
+                // ✅ Get updated sale with items for response
+                const updatedSale = await tx.sales.findUnique({
+                    where: { Id: sale.Id },
+                    include: {
+                        SaleItems: {
+                            include: {
+                                Products: true,
+                            },
+                        },
+                        Customers: true,
+                        CreditPayments: true,
+                        SalePayments: true,
+                    },
+                });
+
                 return {
                     message: 'Return processed successfully',
                     refund: totalRefund,
                     cashRefund: cashRefund,
                     invoiceNumber: dto.invoiceNumber,
+                    totalReturned: totalReturned,
+                    newBalance: newBalance,
+                    sale: updatedSale,
                     CustomerCreditBalance: updatedCustomer?.CreditBalance ? Number(updatedCustomer.CreditBalance) : 0,
                     Customer: updatedCustomer,
                 };
@@ -1120,6 +1194,729 @@ export class SalesService {
         }
 
         return this.cancelSale(sale.Id, reason);
+    }
+
+    // src/sales/sales.service.ts - Add edit sale functionality
+
+    async editSaleAfterCheckout(saleId: string, dto: EditSaleDto) {
+        return await this.prisma.$transaction(async (tx) => {
+            const sale = await tx.sales.findUnique({
+                where: { Id: saleId },
+                include: {
+                    SaleItems: {
+                        include: { Products: true },
+                    },
+                    Customers: true,
+                    SalePayments: true,
+                    CreditPayments: true,
+                },
+            });
+
+            if (!sale) {
+                throw new NotFoundException('Sale not found');
+            }
+
+            if (sale.Status === 2 || sale.Status === 4) {
+                throw new BadRequestException('Cannot edit returned or cancelled invoice');
+            }
+
+            const changes: any[] = [];
+
+            // ✅ PROCESS ITEM UPDATES (if any)
+            if (dto.items && dto.items.length > 0) {
+                const existingItems = sale.SaleItems;
+                const dtoProductIds = dto.items
+                    .map(item => item.productId)
+                    .filter((id): id is string => !!id);
+
+                // Find items to remove
+                const itemsToRemove = existingItems.filter(
+                    item => !dtoProductIds.includes(item.ProductId)
+                );
+
+                for (const item of itemsToRemove) {
+                    await tx.products.update({
+                        where: { Id: item.ProductId },
+                        data: { StockQty: { increment: item.Quantity } },
+                    });
+                    await tx.saleItems.delete({ where: { Id: item.Id } });
+                    changes.push({
+                        action: 'REMOVE_ITEM',
+                        productId: item.ProductId,
+                        productName: item.Products?.Name || 'Unknown',
+                        quantity: item.Quantity,
+                    });
+                }
+
+                // Process new or updated items
+                for (const dtoItem of dto.items) {
+                    if (!dtoItem.productId) continue;
+
+                    const existingItem = existingItems.find(
+                        item => item.ProductId === dtoItem.productId
+                    );
+
+                    if (existingItem) {
+                        // UPDATE EXISTING ITEM
+                        const oldQty = existingItem.Quantity;
+                        const newQty = dtoItem.quantity || existingItem.Quantity;
+                        const qtyDiff = oldQty - newQty;
+
+                        // Update stock
+                        if (qtyDiff > 0) {
+                            await tx.products.update({
+                                where: { Id: existingItem.ProductId },
+                                data: { StockQty: { increment: qtyDiff } },
+                            });
+                        } else if (qtyDiff < 0) {
+                            const product = await tx.products.findUnique({
+                                where: { Id: existingItem.ProductId },
+                            });
+                            if (product && product.StockQty < Math.abs(qtyDiff)) {
+                                throw new BadRequestException('Not enough stock available');
+                            }
+                            await tx.products.update({
+                                where: { Id: existingItem.ProductId },
+                                data: { StockQty: { decrement: Math.abs(qtyDiff) } },
+                            });
+                        }
+
+                        // ✅ Calculate new item total with PER-UNIT discount
+                        const perUnitDiscount = Number(dtoItem.discount ?? 0);
+                        const unitPrice = Number(existingItem.UnitPrice);
+                        const totalDiscount = perUnitDiscount * newQty;
+                        const newTotal = (unitPrice * newQty) - totalDiscount;
+
+                        await tx.saleItems.update({
+                            where: { Id: existingItem.Id },
+                            data: {
+                                Quantity: newQty,
+                                Discount: totalDiscount, // ✅ Store total discount
+                                Total: newTotal,
+                            },
+                        });
+
+                        changes.push({
+                            action: 'UPDATE_ITEM',
+                            productId: existingItem.ProductId,
+                            productName: existingItem.Products?.Name || 'Unknown',
+                            oldQuantity: oldQty,
+                            newQuantity: newQty,
+                            perUnitDiscount: perUnitDiscount,
+                        });
+                    } else {
+                        // ADD NEW ITEM
+                        const product = await tx.products.findUnique({
+                            where: { Id: dtoItem.productId },
+                        });
+
+                        if (!product) {
+                            throw new BadRequestException('Product not found');
+                        }
+
+                        const qty = dtoItem.quantity || 1;
+                        if (product.StockQty < qty) {
+                            throw new BadRequestException('Not enough stock available');
+                        }
+
+                        await tx.products.update({
+                            where: { Id: dtoItem.productId },
+                            data: { StockQty: { decrement: qty } },
+                        });
+
+                        const perUnitDiscount = Number(dtoItem.discount ?? 0);
+                        const unitPrice = Number(product.Price);
+                        const totalDiscount = perUnitDiscount * qty;
+                        const newTotal = (unitPrice * qty) - totalDiscount;
+
+                        await tx.saleItems.create({
+                            data: {
+                                Id: randomUUID(),
+                                SaleId: sale.Id,
+                                ProductId: dtoItem.productId,
+                                Quantity: qty,
+                                UnitPrice: unitPrice,
+                                Discount: totalDiscount,
+                                Total: newTotal,
+                            },
+                        });
+
+                        changes.push({
+                            action: 'ADD_ITEM',
+                            productId: dtoItem.productId,
+                            productName: product.Name,
+                            quantity: qty,
+                            perUnitDiscount: perUnitDiscount,
+                        });
+                    }
+                }
+            }
+
+            // ✅ UPDATE INVOICE DISCOUNT (Separate from item discounts)
+            let invoiceDiscount = Number(sale.InvoiceDiscount);
+            if (dto.invoiceDiscount !== undefined) {
+                invoiceDiscount = dto.invoiceDiscount;
+
+                await tx.sales.update({
+                    where: { Id: sale.Id },
+                    data: { InvoiceDiscount: invoiceDiscount },
+                });
+
+                changes.push({
+                    action: 'UPDATE_INVOICE_DISCOUNT',
+                    oldDiscount: sale.InvoiceDiscount,
+                    newDiscount: invoiceDiscount,
+                });
+            }
+
+            // ✅ UPDATE PAYMENT MODE
+            if (dto.paymentMode) {
+                await tx.sales.update({
+                    where: { Id: sale.Id },
+                    data: { paymentMode: dto.paymentMode },
+                });
+
+                changes.push({
+                    action: 'UPDATE_PAYMENT_MODE',
+                    oldPaymentMode: sale.paymentMode,
+                    newPaymentMode: dto.paymentMode,
+                });
+            }
+
+            // ✅ RECALCULATE TOTALS
+            const updatedItems = await tx.saleItems.findMany({
+                where: { SaleId: sale.Id },
+            });
+
+            // Subtotal = sum of all item totals (after item discounts)
+            const subtotal = updatedItems.reduce(
+                (sum, item) => sum + Number(item.Total),
+                0
+            );
+
+            // ✅ Total = subtotal - invoice discount
+            const totalAmount = Math.max(0, subtotal - invoiceDiscount);
+            const paidAmount = Number(sale.PaidAmount);
+            const balance = Math.max(0, totalAmount - paidAmount);
+
+            // ✅ UPDATE SALE
+            const updatedSale = await tx.sales.update({
+                where: { Id: sale.Id },
+                data: {
+                    SubTotal: subtotal,
+                    CreatedAt: dto.createdAt ? new Date(dto.createdAt) : sale.CreatedAt,
+                    TotalAmount: totalAmount,
+                    BalanceAmount: balance,
+                    IsCreditSale: balance > 0,
+                },
+                include: {
+                    Customers: true,
+                    SaleItems: {
+                        include: {
+                            Products: true,
+                        },
+                    },
+                    SalePayments: true,
+                    CreditPayments: true,
+                },
+            });
+
+            // ✅ UPDATE CUSTOMER CREDIT BALANCE
+            if (updatedSale.CustomerId) {
+                await this.recalculateCustomerBalance(tx, updatedSale.CustomerId);
+            }
+
+            console.log('📝 Invoice Edit Summary:', {
+                invoiceNumber: sale.InvoiceNumber,
+                changes,
+                totals: {
+                    oldTotal: sale.TotalAmount,
+                    newTotal: totalAmount,
+                    oldBalance: sale.BalanceAmount,
+                    newBalance: balance,
+                    oldSubtotal: sale.SubTotal,
+                    newSubtotal: subtotal,
+                    invoiceDiscount: invoiceDiscount,
+                },
+            });
+
+            return {
+                message: 'Sale updated successfully',
+                sale: updatedSale,
+                changes,
+                summary: {
+                    oldTotal: sale.TotalAmount,
+                    newTotal: totalAmount,
+                    oldBalance: sale.BalanceAmount,
+                    newBalance: balance,
+                    oldSubtotal: sale.SubTotal,
+                    newSubtotal: subtotal,
+                    invoiceDiscount: invoiceDiscount,
+                    itemsAdded: changes.filter(c => c.action === 'ADD_ITEM').length,
+                    itemsRemoved: changes.filter(c => c.action === 'REMOVE_ITEM').length,
+                    itemsUpdated: changes.filter(c => c.action === 'UPDATE_ITEM').length,
+                },
+            };
+        }, {
+            timeout: 30000,
+            maxWait: 15000,
+        });
+    }
+
+
+
+
+
+    async updateSaleItem(saleId: string, itemId: string, dto: UpdateSaleItemDto) {
+        console.log('🔍 updateSaleItem called with:', { saleId, itemId, dto });
+
+        return await this.prisma.$transaction(async (tx) => {
+            // 1. Check if sale exists and is editable
+            const sale = await tx.sales.findUnique({
+                where: { Id: saleId },
+                include: { SaleItems: true },
+            });
+
+            if (!sale) {
+                throw new NotFoundException('Sale not found');
+            }
+
+            if (sale.Status === 2 || sale.Status === 4) {
+                throw new BadRequestException('Cannot edit returned or cancelled invoice');
+            }
+
+            // 2. Find the sale item
+            let saleItem = await tx.saleItems.findUnique({
+                where: { Id: itemId },
+                include: { Products: true },
+            });
+
+            if (!saleItem) {
+                // Try finding by ProductId as fallback
+                saleItem = await tx.saleItems.findFirst({
+                    where: {
+                        SaleId: saleId,
+                        ProductId: itemId,
+                    },
+                    include: { Products: true },
+                });
+
+                if (!saleItem) {
+                    throw new NotFoundException(`Sale item not found with Id: ${itemId}`);
+                }
+            }
+
+            console.log('✅ Found sale item:', {
+                Id: saleItem.Id,
+                Quantity: saleItem.Quantity,
+                UnitPrice: saleItem.UnitPrice,
+                CurrentDiscount: saleItem.Discount,
+            });
+
+            // 3. Calculate stock adjustment
+            const oldQuantity = Number(saleItem.Quantity);
+            const newQuantity = Number(dto.quantity);
+            const quantityDiff = oldQuantity - newQuantity;
+
+            // 4. Update stock
+            if (quantityDiff > 0) {
+                await tx.products.update({
+                    where: { Id: saleItem.ProductId },
+                    data: { StockQty: { increment: quantityDiff } },
+                });
+            } else if (quantityDiff < 0) {
+                const product = await tx.products.findUnique({
+                    where: { Id: saleItem.ProductId },
+                });
+                if (product && product.StockQty < Math.abs(quantityDiff)) {
+                    throw new BadRequestException(
+                        `Not enough stock available for ${product.Name}. Available: ${product.StockQty}`
+                    );
+                }
+                await tx.products.update({
+                    where: { Id: saleItem.ProductId },
+                    data: { StockQty: { decrement: Math.abs(quantityDiff) } },
+                });
+            }
+
+            // 5. ✅ FIX: Calculate discount correctly
+            // The discount from frontend is the PER-UNIT discount amount
+            // So total discount = perUnitDiscount * quantity
+            const unitPrice = Number(saleItem.UnitPrice);
+            const perUnitDiscount = Number(dto.discount ?? 0);
+            const totalDiscount = perUnitDiscount * newQuantity;
+
+            // Calculate new total
+            const newTotal = (unitPrice * newQuantity) - totalDiscount;
+
+            console.log('📊 Discount calculation:', {
+                unitPrice,
+                perUnitDiscount,
+                newQuantity,
+                totalDiscount,
+                newTotal,
+            });
+
+            // 6. Update sale item
+            const updatedItem = await tx.saleItems.update({
+                where: { Id: itemId },
+                data: {
+                    Quantity: newQuantity,
+                    Discount: totalDiscount, // ✅ Store TOTAL discount, not per-unit
+                    Total: newTotal,
+                },
+                include: {
+                    Products: true,
+                },
+            });
+
+            console.log('✅ Updated item:', {
+                Id: updatedItem.Id,
+                Quantity: updatedItem.Quantity,
+                Discount: updatedItem.Discount,
+                Total: updatedItem.Total,
+            });
+
+            // 7. Recalculate sale totals
+            await this.recalculateSaleTotals(tx, saleId);
+
+            // 8. Calculate discount percentage correctly for response
+            const perUnitDiscountValue = Number(updatedItem.Discount) / Number(updatedItem.Quantity);
+            const unitPriceValue = Number(updatedItem.UnitPrice);
+            const discountPercent = unitPriceValue > 0
+                ? Math.round((perUnitDiscountValue / unitPriceValue) * 100)
+                : 0;
+
+            return {
+                message: 'Sale item updated successfully',
+                item: {
+                    Id: updatedItem.Id,
+                    SaleId: updatedItem.SaleId,
+                    ProductId: updatedItem.ProductId,
+                    Quantity: updatedItem.Quantity,
+                    UnitPrice: updatedItem.UnitPrice,
+                    Total: updatedItem.Total,
+                    Discount: updatedItem.Discount,
+                    DiscountPercent: discountPercent,
+                    PerUnitDiscount: perUnitDiscountValue,
+                    ProductName: updatedItem.Products?.Name || 'Unknown Product',
+                    Products: updatedItem.Products,
+                },
+            };
+        }, {
+            timeout: 30000,
+            maxWait: 15000,
+        });
+    }
+
+    // =========================
+    // INTERNAL HELPER: Update Sale Item (for fallback)
+    // =========================
+    private async updateSaleItemInternal(
+        tx: any,
+        saleId: string,
+        itemId: string,
+        dto: UpdateSaleItemDto
+    ) {
+        // Find the sale item
+        const saleItem = await tx.saleItems.findUnique({
+            where: { Id: itemId },
+            include: { Products: true },
+        });
+
+        if (!saleItem) {
+            throw new NotFoundException(`Sale item not found with Id: ${itemId}`);
+        }
+
+        // Calculate stock adjustment
+        const oldQuantity = Number(saleItem.Quantity);
+        const newQuantity = Number(dto.quantity);
+        const quantityDiff = oldQuantity - newQuantity;
+
+        // Update stock
+        if (quantityDiff > 0) {
+            await tx.products.update({
+                where: { Id: saleItem.ProductId },
+                data: { StockQty: { increment: quantityDiff } },
+            });
+        } else if (quantityDiff < 0) {
+            const product = await tx.products.findUnique({
+                where: { Id: saleItem.ProductId },
+            });
+            if (product && product.StockQty < Math.abs(quantityDiff)) {
+                throw new BadRequestException('Not enough stock available');
+            }
+            await tx.products.update({
+                where: { Id: saleItem.ProductId },
+                data: { StockQty: { decrement: Math.abs(quantityDiff) } },
+            });
+        }
+
+        // Calculate new total
+        const newDiscount = Number(dto.discount ?? saleItem.Discount);
+        const unitPrice = Number(saleItem.UnitPrice);
+        const newTotal = (unitPrice * newQuantity) - newDiscount;
+
+        // Update sale item
+        const updatedItem = await tx.saleItems.update({
+            where: { Id: itemId },
+            data: {
+                Quantity: newQuantity,
+                Discount: newDiscount,
+                Total: newTotal,
+            },
+            include: {
+                Products: true,
+            },
+        });
+
+        // Recalculate sale totals
+        await this.recalculateSaleTotals(tx, saleId);
+
+        // Calculate discount percentage correctly
+        const perUnitDiscount = Number(updatedItem.Discount);
+        const unitPriceValue = Number(updatedItem.UnitPrice);
+        const discountPercent = unitPriceValue > 0
+            ? Math.round((perUnitDiscount / unitPriceValue) * 100)
+            : 0;
+
+        return {
+            message: 'Sale item updated successfully',
+            item: {
+                Id: updatedItem.Id,
+                SaleId: updatedItem.SaleId,
+                ProductId: updatedItem.ProductId,
+                Quantity: updatedItem.Quantity,
+                UnitPrice: updatedItem.UnitPrice,
+                Total: updatedItem.Total,
+                Discount: updatedItem.Discount,
+                DiscountPercent: discountPercent,
+                ProductName: updatedItem.Products?.Name || 'Unknown Product',
+                Products: updatedItem.Products,
+            },
+        };
+    }
+
+    // =========================
+    // HELPER: Recalculate Sale Totals
+    // =========================
+    private async recalculateSaleTotals(tx: any, saleId: string) {
+        // Get all sale items
+        const items = await tx.saleItems.findMany({
+            where: { SaleId: saleId },
+        });
+
+        // Calculate subtotal
+        const subtotal = items.reduce((sum, item) => sum + Number(item.Total), 0);
+
+        // Get sale
+        const sale = await tx.sales.findUnique({
+            where: { Id: saleId },
+        });
+
+        // Calculate total with discount
+        const invoiceDiscount = Number(sale?.InvoiceDiscount || 0);
+        const totalAmount = Math.max(0, subtotal - invoiceDiscount);
+
+        // Calculate balance
+        const paidAmount = Number(sale?.PaidAmount || 0);
+        const balance = Math.max(0, totalAmount - paidAmount);
+
+        // Update sale
+        await tx.sales.update({
+            where: { Id: saleId },
+            data: {
+                SubTotal: subtotal,
+                TotalAmount: totalAmount,
+                BalanceAmount: balance,
+                IsCreditSale: balance > 0,
+            },
+        });
+
+        // Update customer credit balance if credit sale
+        if (sale?.CustomerId && sale?.IsCreditSale) {
+            const allSales = await tx.sales.findMany({
+                where: {
+                    CustomerId: sale.CustomerId,
+                    BalanceAmount: { gt: 0 },
+                },
+            });
+            const totalOutstanding = allSales.reduce(
+                (sum, s) => sum + Number(s.BalanceAmount),
+                0
+            );
+            await tx.customers.update({
+                where: { Id: sale.CustomerId },
+                data: {
+                    CreditBalance: totalOutstanding,
+                },
+            });
+        }
+    }
+
+    // =========================
+    // ADD ITEM TO SALE
+    // =========================
+    async addSaleItem(saleId: string, dto: AddSaleItemDto) {
+        return await this.prisma.$transaction(async (tx) => {
+            // 1. Check if sale exists and is editable
+            const sale = await tx.sales.findUnique({
+                where: { Id: saleId },
+                include: { SaleItems: true },
+            });
+
+            if (!sale) {
+                throw new NotFoundException('Sale not found');
+            }
+
+            if (sale.Status === 2 || sale.Status === 4) {
+                throw new BadRequestException('Cannot add items to returned or cancelled invoice');
+            }
+
+            // ✅ FIX: Ensure productId exists
+            if (!dto.productId) {
+                throw new BadRequestException('Product ID is required');
+            }
+
+            // 2. Get product
+            const product = await tx.products.findUnique({
+                where: { Id: dto.productId },
+            });
+
+            if (!product) {
+                throw new BadRequestException('Product not found');
+            }
+
+            // ✅ FIX: Ensure quantity is a number
+            const quantity = Number(dto.quantity || 0);
+            if (quantity <= 0) {
+                throw new BadRequestException('Quantity must be greater than 0');
+            }
+
+            if (product.StockQty < quantity) {
+                throw new BadRequestException('Not enough stock available');
+            }
+
+            // 3. Reduce stock
+            await tx.products.update({
+                where: { Id: dto.productId },
+                data: { StockQty: { decrement: quantity } },
+            });
+
+            // 4. Create sale item - ✅ FIX: All values are now guaranteed to be defined
+            const discount = Number(dto.discount ?? 0);
+            const unitPrice = Number(product.Price);
+            const total = (unitPrice * quantity) - discount;
+
+            const newItem = await tx.saleItems.create({
+                data: {
+                    Id: randomUUID(),
+                    SaleId: saleId,
+                    ProductId: dto.productId, // ✅ Now guaranteed to be a string
+                    Quantity: quantity,
+                    UnitPrice: unitPrice,
+                    Discount: discount,
+                    Total: total,
+                },
+                include: {
+                    Products: true,
+                },
+            });
+
+            // 5. Recalculate sale totals
+            await this.recalculateSaleTotals(tx, saleId);
+
+            return {
+                message: 'Item added to sale successfully',
+                item: newItem,
+            };
+        }, {
+            timeout: 30000,
+            maxWait: 15000,
+        });
+    }
+
+    // =========================
+    // REMOVE ITEM FROM SALE
+    // =========================
+    async removeSaleItem(saleId: string, itemId: string) {
+        return await this.prisma.$transaction(async (tx) => {
+            // 1. Check if sale exists and is editable
+            const sale = await tx.sales.findUnique({
+                where: { Id: saleId },
+                include: { SaleItems: true },
+            });
+
+            if (!sale) {
+                throw new NotFoundException('Sale not found');
+            }
+
+            if (sale.Status === 2 || sale.Status === 4) {
+                throw new BadRequestException('Cannot remove items from returned or cancelled invoice');
+            }
+
+            // 2. Find sale item
+            const saleItem = await tx.saleItems.findUnique({
+                where: { Id: itemId },
+            });
+
+            if (!saleItem) {
+                throw new NotFoundException('Sale item not found');
+            }
+
+            // 3. Restore stock
+            await tx.products.update({
+                where: { Id: saleItem.ProductId },
+                data: { StockQty: { increment: saleItem.Quantity } },
+            });
+
+            // 4. Delete sale item
+            await tx.saleItems.delete({
+                where: { Id: itemId },
+            });
+
+            // 5. Recalculate sale totals
+            await this.recalculateSaleTotals(tx, saleId);
+
+            return {
+                message: 'Item removed from sale successfully',
+            };
+        }, {
+            timeout: 30000,
+            maxWait: 15000,
+        });
+    }
+
+    private async recalculateCustomerBalance(tx: any, customerId: string): Promise<number> {
+        // 1. Get all sales for this customer with outstanding balance
+        const sales = await tx.sales.findMany({
+            where: {
+                CustomerId: customerId,
+                BalanceAmount: { gt: 0 },
+                Status: { not: 4 }, // Exclude cancelled sales
+            },
+            select: {
+                BalanceAmount: true,
+            },
+        });
+
+        // 2. Calculate total outstanding balance
+        const totalBalance = sales.reduce(
+            (sum, sale) => sum + Number(sale.BalanceAmount),
+            0
+        );
+
+        // 3. Update customer's credit balance
+        await tx.customers.update({
+            where: { Id: customerId },
+            data: {
+                CreditBalance: totalBalance,
+            },
+        });
+
+        console.log(`🔄 Recalculated balance for customer ${customerId}: ${totalBalance}`);
+
+        return totalBalance;
     }
 
 }
