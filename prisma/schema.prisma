@@ -50,6 +50,11 @@ model CreditPayments {
   Amount Decimal  @db.Decimal
   PaidAt DateTime @db.Timestamptz(6)
   Note   String?
+  PaymentMethod String   @default("cash")  // 'cash' | 'card' | 'cheque' | 'bank_transfer'
+  Reference     String?                     // cheque number, bank ref, card ref
+  ChequeDate    DateTime? @db.Timestamptz(6) // only when method = 'cheque'
+  Status        String   @default("cleared") // 'pending' | 'cleared' | 'bounced' — mostly for cheque
+  ClearedAt     DateTime? @db.Timestamptz(6) // when a pending cheque is confirmed
   Sales  Sales    @relation(fields: [SaleId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_CreditPayments_Sales_SaleId")
 
   @@index([SaleId], map: "IX_CreditPayments_SaleId")

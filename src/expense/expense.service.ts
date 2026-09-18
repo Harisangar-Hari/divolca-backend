@@ -1,3 +1,4 @@
+//src/expense/expense.service.ts
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CashLedgerService } from '../cash-ledger/cash-ledger.service';

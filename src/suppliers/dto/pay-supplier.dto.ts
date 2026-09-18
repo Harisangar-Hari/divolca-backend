@@ -1,3 +1,4 @@
+//src/suppliers/dto/pay-supplier.dto.ts
 import { IsNumber, IsOptional, IsString, IsUUID } from 'class-validator';
 
 

@@ -6,75 +6,55 @@ import {
     Param,
     HttpCode,
     Delete,
-    HttpStatus
+    HttpStatus,
 } from '@nestjs/common';
 
-
 import { PurchasesService } from './purchases.service';
-
 import { CreatePurchaseDto } from './dto/create-purchase.dto';
-
-
+import { Permissions } from '../auth/decorators/permissions.decorator';
 
 @Controller('purchases')
 export class PurchasesController {
-
-
-    constructor(
-        private service: PurchasesService
-    ) { }
-
-
+    constructor(private service: PurchasesService) { }
 
     @Post()
-    create(
-        @Body() dto: CreatePurchaseDto
-    ) {
-
+    @Permissions('canCreatePurchases')
+    create(@Body() dto: CreatePurchaseDto) {
         return this.service.create(dto);
-
     }
-
-
 
     @Get()
+    @Permissions('canViewPurchases')
     findAll() {
-
         return this.service.findAll();
-
     }
-
-
-
 
     @Get(':id')
-    findOne(
-        @Param('id') id: string
-    ) {
-
+    @Permissions('canViewPurchases')
+    findOne(@Param('id') id: string) {
         return this.service.findOne(id);
-
     }
 
-     @Delete('cancel/:id')
+    @Delete('cancel/:id')
+    @Permissions('canDeletePurchases')
     @HttpCode(HttpStatus.OK)
     async cancelPurchase(
         @Param('id') id: string,
-        @Body() body?: { reason?: string }
+        @Body() body?: { reason?: string },
     ) {
         return this.service.cancelPurchase(id, body?.reason);
     }
 
-    // ✅ Cancel purchase by invoice number
     @Delete('cancel/invoice/:invoiceNumber')
+    @Permissions('canDeletePurchases')
     @HttpCode(HttpStatus.OK)
     async cancelPurchaseByInvoice(
         @Param('invoiceNumber') invoiceNumber: string,
-        @Body() body?: { reason?: string }
+        @Body() body?: { reason?: string },
     ) {
-        return this.service.cancelPurchaseByInvoice(invoiceNumber, body?.reason);
+        return this.service.cancelPurchaseByInvoice(
+            invoiceNumber,
+            body?.reason,
+        );
     }
-
-
-
 }

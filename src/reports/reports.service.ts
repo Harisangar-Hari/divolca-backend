@@ -540,23 +540,19 @@ export class ReportsService {
 
         // ✅ Build CreatedAt filter properly
         const createdAtFilter: Prisma.DateTimeFilter = {};
-
         if (filters.startDate) {
             createdAtFilter.gte = filters.startDate;
         }
 
         if (filters.endDate) {
-            createdAtFilter.lte = filters.endDate;
+            const end = new Date(filters.endDate);
+            end.setUTCDate(end.getUTCDate() + 1);
+            createdAtFilter.lt = end;      // ✅ less-than, not less-than-or-equal
         }
 
         if (Object.keys(createdAtFilter).length > 0) {
             where.CreatedAt = createdAtFilter;
         }
-
-        if (filters.paymentMode) {
-            where.paymentMode = filters.paymentMode;
-        }
-
         const sales = await this.prisma.sales.findMany({
             where,
             include: {
@@ -799,6 +795,226 @@ export class ReportsService {
                 IsCreditSale: sale.IsCreditSale,
                 Items: sale.SaleItems.length,
             })),
+        };
+    }
+
+
+    // ============================
+    // CUSTOMER AGING ANALYSIS
+    // ============================
+    async getCustomerAging() {
+        // Get all customers that have at least one unpaid sale
+        const customers = await this.prisma.customers.findMany({
+            where: {
+                Sales: {
+                    some: {
+                        BalanceAmount: { gt: 0 },
+                        Status: { not: 4 }, // exclude cancelled
+                    },
+                },
+            },
+            include: {
+                Sales: {
+                    where: {
+                        BalanceAmount: { gt: 0 },
+                        Status: { not: 4 },
+                    },
+                    select: {
+                        Id: true,
+                        InvoiceNumber: true,
+                        CreatedAt: true,
+                        BalanceAmount: true,
+                        TotalAmount: true,
+                    },
+                    orderBy: { CreatedAt: 'asc' },
+                },
+            },
+            orderBy: { Name: 'asc' },
+        });
+
+        const now = new Date();
+
+        const result = customers.map((customer) => {
+            const buckets = {
+                days0to30: 0,
+                days31to60: 0,
+                days61to90: 0,
+                days91to120: 0,
+                days121to150: 0,
+                days151plus: 0,
+            };
+
+            const invoices: Array<{
+                InvoiceNumber: string;
+                CreatedAt: Date;
+                BalanceAmount: number;
+                AgeDays: number;
+                Bucket: string;
+            }> = [];
+
+            for (const sale of customer.Sales) {
+                const balance = Number(sale.BalanceAmount || 0);
+                const ageMs = now.getTime() - new Date(sale.CreatedAt).getTime();
+                const ageDays = Math.floor(ageMs / (1000 * 60 * 60 * 24));
+
+                let bucket: keyof typeof buckets;
+                if (ageDays <= 30) bucket = 'days0to30';
+                else if (ageDays <= 60) bucket = 'days31to60';
+                else if (ageDays <= 90) bucket = 'days61to90';
+                else if (ageDays <= 120) bucket = 'days91to120';
+                else if (ageDays <= 150) bucket = 'days121to150';
+                else bucket = 'days151plus';
+
+                buckets[bucket] += balance;
+
+                invoices.push({
+                    InvoiceNumber: sale.InvoiceNumber,
+                    CreatedAt: sale.CreatedAt,
+                    BalanceAmount: balance,
+                    AgeDays: ageDays,
+                    Bucket: bucket,
+                });
+            }
+
+            const totalOutstanding =
+                buckets.days0to30 +
+                buckets.days31to60 +
+                buckets.days61to90 +
+                buckets.days91to120 +
+                buckets.days121to150 +
+                buckets.days151plus;
+
+            return {
+                CustomerId: customer.Id,
+                CustomerName: customer.Name,
+                CustomerPhone: customer.Phone,
+                CustomerEmail: customer.Email,
+                CustomerType: customer.CustomerType,
+                CreditLimit: Number(customer.CreditLimit || 0),
+                CreditBalance: Number(customer.CreditBalance || 0),
+
+                days0to30: buckets.days0to30,
+                days31to60: buckets.days31to60,
+                days61to90: buckets.days61to90,
+                days91to120: buckets.days91to120,
+                days121to150: buckets.days121to150,
+                days151plus: buckets.days151plus,
+
+                TotalOutstanding: totalOutstanding,
+                InvoiceCount: invoices.length,
+
+                Invoices: invoices,
+            };
+        });
+
+        // Compute grand totals
+        const totals = result.reduce(
+            (acc, c) => {
+                acc.days0to30 += c.days0to30;
+                acc.days31to60 += c.days31to60;
+                acc.days61to90 += c.days61to90;
+                acc.days91to120 += c.days91to120;
+                acc.days121to150 += c.days121to150;
+                acc.days151plus += c.days151plus;
+                acc.TotalOutstanding += c.TotalOutstanding;
+                return acc;
+            },
+            {
+                days0to30: 0,
+                days31to60: 0,
+                days61to90: 0,
+                days91to120: 0,
+                days121to150: 0,
+                days151plus: 0,
+                TotalOutstanding: 0,
+            }
+        );
+
+        return {
+            generatedAt: now,
+            customers: result,
+            totals,
+        };
+    }
+
+
+
+
+    // ============================
+    // OUTSTANDING INVOICES (flat list, one row per unpaid invoice)
+    // ============================
+    async getOutstandingInvoices() {
+        const sales = await this.prisma.sales.findMany({
+            where: {
+                BalanceAmount: { gt: 0 },
+                Status: { not: 4 }, // exclude cancelled
+            },
+            include: {
+                Customers: {
+                    select: {
+                        Id: true,
+                        Name: true,
+                        Phone: true,
+                        CustomerType: true,
+                    },
+                },
+            },
+            orderBy: [
+                { CreatedAt: 'asc' }, // oldest first
+            ],
+        });
+
+        const now = new Date();
+
+        const rows = sales.map((sale) => {
+            const ageMs = now.getTime() - new Date(sale.CreatedAt).getTime();
+            const ageDays = Math.floor(ageMs / (1000 * 60 * 60 * 24));
+
+            let bucket: string;
+            if (ageDays <= 30) bucket = '0-30';
+            else if (ageDays <= 60) bucket = '31-60';
+            else if (ageDays <= 90) bucket = '61-90';
+            else if (ageDays <= 120) bucket = '91-120';
+            else if (ageDays <= 150) bucket = '121-150';
+            else bucket = '>=151';
+
+            return {
+                SaleId: sale.Id,
+                InvoiceNumber: sale.InvoiceNumber,
+                InvoiceDate: sale.CreatedAt,
+
+                CustomerId: sale.CustomerId,
+                CustomerName: sale.Customers?.Name || 'Walk-in Customer',
+                CustomerPhone: sale.Customers?.Phone || '',
+                CustomerType: sale.Customers?.CustomerType || 'RETAIL',
+
+                PaymentMode: sale.paymentMode || 'cash',
+                IsCreditSale: sale.IsCreditSale,
+
+                TotalAmount: Number(sale.TotalAmount || 0),
+                PaidAmount: Number(sale.PaidAmount || 0),
+                BalanceAmount: Number(sale.BalanceAmount || 0),
+
+                AgeDays: ageDays,
+                Bucket: bucket,
+            };
+        });
+
+        const totals = rows.reduce(
+            (acc, r) => {
+                acc.TotalAmount += r.TotalAmount;
+                acc.PaidAmount += r.PaidAmount;
+                acc.BalanceAmount += r.BalanceAmount;
+                return acc;
+            },
+            { TotalAmount: 0, PaidAmount: 0, BalanceAmount: 0 }
+        );
+
+        return {
+            generatedAt: now,
+            count: rows.length,
+            rows,
+            totals,
         };
     }
 }

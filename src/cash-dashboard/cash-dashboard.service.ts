@@ -1,3 +1,4 @@
+//src/cash-dashboard/cash-dashboard.service.ts
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { BadRequestException } from '@nestjs/common';

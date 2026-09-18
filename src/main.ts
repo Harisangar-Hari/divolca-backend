@@ -4,6 +4,7 @@ import { AppModule } from './app.module';
 
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { ValidationPipe } from '@nestjs/common';
+import cookieParser from 'cookie-parser';
 import {
   join
 } from 'path';
@@ -34,6 +35,8 @@ async function bootstrap() {
     credentials: true
 
   });
+  app.use(cookieParser());
+
 
 
   // Same as ASP.NET Route Prefix: api/
@@ -50,8 +53,11 @@ async function bootstrap() {
         type: 'http',
         scheme: 'bearer',
         bearerFormat: 'JWT',
+        name: 'Authorization',
+        description: 'Enter JWT token',
+        in: 'header',
       },
-      'JWT-auth',
+      'JWT-auth', // ✅ This name must match @ApiBearerAuth('JWT-auth')
     )
     .build();
 

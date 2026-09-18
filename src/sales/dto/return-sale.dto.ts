@@ -1,3 +1,5 @@
+//src/sales/dto/return-sale.dto.ts
+
 import { IsArray, IsOptional, IsString, IsNumber, IsUUID } from "class-validator";
 
 

@@ -1,3 +1,4 @@
+//src/cash-dashboard/dto/manual-cash.dto.ts
 import {
     IsIn,
     IsNotEmpty,

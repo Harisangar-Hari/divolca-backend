@@ -1,9 +1,11 @@
+//src/sales/sales.service.ts
 import { Injectable, BadRequestException, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { CashLedgerService } from '../cash-ledger/cash-ledger.service';
 import { AddSaleItemDto, CreateCheckoutDto, EditSaleDto, UpdateSaleItemDto } from './dto/checkout.dto';
 import { randomUUID } from 'crypto';
 import { CreateSaleReturnDto } from './dto/return-sale.dto';
+import { RecordBulkCreditChequeDto, RecordCreditChequeDto } from './dto/record-credit-cheque.dto';
 
 export enum PaymentMode {
     CASH = 'cash',
@@ -491,6 +493,17 @@ export class SalesService {
                 });
             }
 
+            // Update customer credit balance
+            if (sale.CustomerId) {
+                await tx.customers.update({
+                    where: { Id: sale.CustomerId },
+                    data: {
+                        CreditBalance: { decrement: amount },
+                        LastPaymentDate: new Date(),
+                    },
+                });
+            }
+
             // Cash ledger entry
             await this.cashLedger.add(
                 'IN',
@@ -542,14 +555,22 @@ export class SalesService {
                     throw new BadRequestException('Invoice is already fully returned');
                 }
 
-                // ✅ Calculate invoice discount percentage
-                const totalAmount = Number(sale.TotalAmount);
-                const subTotal = Number(sale.SubTotal);
-                const invoiceDiscountAmount = Number(sale.InvoiceDiscount);
-                const discountPercentage = subTotal > 0 ? (invoiceDiscountAmount / subTotal) * 100 : 0;
+                // ============================================================
+                // ✅ Correct invoice discount rate
+                // Sale.TotalAmount = AfterItemDiscount − InvoiceDiscount
+                // So AfterItemDiscount = TotalAmount + InvoiceDiscount
+                // rate = InvoiceDiscount / AfterItemDiscount
+                // ============================================================
+                const originalInvoiceDiscount = Number(sale.InvoiceDiscount);
+                const originalTotalAmount = Number(sale.TotalAmount);
+                const originalAfterItemDiscount =
+                    originalTotalAmount + originalInvoiceDiscount;
+                const invoiceDiscountRate =
+                    originalAfterItemDiscount > 0
+                        ? originalInvoiceDiscount / originalAfterItemDiscount
+                        : 0;
 
                 let totalRefund = 0;
-                const returnedItemIds: string[] = [];
 
                 // Create Sale Return
                 const saleReturn = await tx.saleReturns.create({
@@ -574,7 +595,7 @@ export class SalesService {
                         );
                     }
 
-                    // ✅ Calculate already returned quantity for this item
+                    // Calculate already returned quantity for this item
                     const alreadyReturned = sale.SaleReturns.reduce(
                         (sum, ret) =>
                             sum +
@@ -593,13 +614,27 @@ export class SalesService {
                         );
                     }
 
-                    // ✅ Calculate refund amount with invoice discount proration
                     const unitPrice = Number(saleItem.UnitPrice);
-                    const itemSubtotal = unitPrice * item.quantity;
+                    const totalLineDiscount = Number(saleItem.Discount);
 
-                    // ✅ Apply proportional invoice discount
-                    const itemDiscount = (itemSubtotal * discountPercentage) / 100;
-                    const refundAmount = itemSubtotal - itemDiscount;
+                    // ✅ Per-unit item discount (so partial returns prorate correctly)
+                    const perUnitItemDiscount =
+                        originalQuantity > 0
+                            ? totalLineDiscount / originalQuantity
+                            : 0;
+
+                    // ============================================================
+                    // ✅ Refund = (unitPrice − perUnitItemDiscount) × qty
+                    //            × (1 − invoiceDiscountRate)
+                    // Handles BOTH item-level and invoice-level discounts.
+                    // ============================================================
+                    const grossForThisQty = unitPrice * item.quantity;
+                    const itemDiscountForThisQty =
+                        perUnitItemDiscount * item.quantity;
+                    const afterItemDiscount =
+                        grossForThisQty - itemDiscountForThisQty;
+                    const refundAmount =
+                        afterItemDiscount * (1 - invoiceDiscountRate);
 
                     totalRefund += refundAmount;
 
@@ -621,51 +656,76 @@ export class SalesService {
                         },
                     });
 
-                    // Store the sale item ID for later update
-                    returnedItemIds.push(saleItem.Id);
-
-                    // ✅ UPDATE THE SALE ITEM - Reduce quantity or delete
-                    const remainingQty = originalQuantity - item.quantity - alreadyReturned;
+                    // ============================================================
+                    // ✅ UPDATE THE SALE ITEM
+                    // Reduce qty, Discount, AND Total so the discount %
+                    // displayed on the frontend stays correct.
+                    // ============================================================
+                    const remainingQty =
+                        originalQuantity - item.quantity - alreadyReturned;
 
                     if (remainingQty <= 0) {
-                        // Delete the sale item if fully returned
                         await tx.saleItems.delete({
                             where: { Id: saleItem.Id },
                         });
                     } else {
-                        // Update the sale item with new quantity and total
-                        const newTotal = unitPrice * remainingQty;
+                        const newDiscount = perUnitItemDiscount * remainingQty;
+                        const newTotal = unitPrice * remainingQty - newDiscount;
+
                         await tx.saleItems.update({
                             where: { Id: saleItem.Id },
                             data: {
                                 Quantity: remainingQty,
-                                Total: newTotal,
+                                Discount: newDiscount, // ✅ prorated
+                                Total: newTotal,       // ✅ after discount
                             },
                         });
                     }
                 }
 
-                // ✅ Update return total
+                // Update return total
                 await tx.saleReturns.update({
                     where: { Id: saleReturn.Id },
                     data: { ReturnAmount: totalRefund },
                 });
 
-                // ✅ Update sale
-                const totalReturned = Number(sale.ReturnedAmount ?? 0) + totalRefund;
-                const totalPaid = Number(sale.PaidAmount);
-                const totalAmountValue = Number(sale.TotalAmount);
+                // ============================================================
+                // ✅ RECOMPUTE sale totals from the REMAINING items
+                // ============================================================
+                const remainingItems = await tx.saleItems.findMany({
+                    where: { SaleId: sale.Id },
+                });
 
-                // Calculate new paid amount (reduce by refund amount)
-                const newPaid = Math.max(0, totalPaid - totalRefund);
-                const newBalance = Math.max(0, totalAmountValue - totalReturned);
+                let newSubTotal = 0;          // raw price × qty
+                let newAfterItemDiscount = 0; // after item discount
 
-                let status = SaleStatus.PENDING;
-                if (totalReturned >= totalAmountValue) {
+                for (const it of remainingItems) {
+                    const raw = Number(it.UnitPrice) * it.Quantity;
+                    const disc = Number(it.Discount);
+                    newSubTotal += raw;
+                    newAfterItemDiscount += raw - disc;
+                }
+
+                const newInvoiceDiscount =
+                    newAfterItemDiscount * invoiceDiscountRate;
+                const newTotalAmount =
+                    newAfterItemDiscount - newInvoiceDiscount;
+
+                const totalReturned =
+                    Number(sale.ReturnedAmount ?? 0) + totalRefund;
+
+                // Status: fully returned if nothing remains
+                let status: SaleStatus;
+                if (newTotalAmount <= 0.01) {
                     status = SaleStatus.FULLY_RETURNED;
-                } else if (totalReturned > 0) {
+                } else {
                     status = SaleStatus.PARTIALLY_RETURNED;
                 }
+
+                // Paid / balance after refund
+                const totalPaid = Number(sale.PaidAmount);
+                const newPaid = Math.max(0, totalPaid - totalRefund);
+                const newBalance = Math.max(0, newTotalAmount - newPaid);
 
                 await tx.sales.update({
                     where: { Id: sale.Id },
@@ -675,21 +735,19 @@ export class SalesService {
                         PaidAmount: newPaid,
                         BalanceAmount: newBalance,
                         Status: status,
-                        // ✅ Update total amount to reflect remaining value
-                        TotalAmount: totalAmountValue - totalReturned,
-                        // ✅ Update SubTotal to reflect remaining value
-                        SubTotal: subTotal - (totalRefund / (1 - discountPercentage / 100)),
-                        // ✅ Update InvoiceDiscount to reflect remaining discount
-                        InvoiceDiscount: (subTotal - (totalRefund / (1 - discountPercentage / 100))) * (discountPercentage / 100),
+                        SubTotal: newSubTotal,
+                        InvoiceDiscount: newInvoiceDiscount,
+                        TotalAmount: newTotalAmount,
                         ...(status === SaleStatus.FULLY_RETURNED && {
                             IsCreditSale: false,
                         }),
                     },
                 });
 
-                // Customer ledger and credit balance update
+                // ============================================================
+                // Customer ledger + credit balance
+                // ============================================================
                 if (sale.CustomerId) {
-                    // Create customer ledger entry for the return
                     await tx.customerLedgerEntries.create({
                         data: {
                             Id: randomUUID(),
@@ -703,25 +761,34 @@ export class SalesService {
                         },
                     });
 
-                    // ✅ UPDATE CUSTOMER'S CREDIT BALANCE
                     if (sale.Customers) {
-                        const currentBalance = Number(sale.Customers.CreditBalance) || 0;
-                        const refundAmount = Math.min(totalRefund, currentBalance);
+                        // ✅ Recalculate from unpaid sales (self-healing)
+                        const unpaid = await tx.sales.aggregate({
+                            where: {
+                                CustomerId: sale.CustomerId,
+                                BalanceAmount: { gt: 0 },
+                                Status: { not: 4 },
+                            },
+                            _sum: { BalanceAmount: true },
+                        });
 
-                        if (refundAmount > 0) {
-                            await tx.customers.update({
-                                where: { Id: sale.CustomerId },
-                                data: {
-                                    CreditBalance: { decrement: refundAmount },
-                                    TotalSpent: { decrement: totalRefund },
-                                },
-                            });
-                        }
+                        await tx.customers.update({
+                            where: { Id: sale.CustomerId },
+                            data: {
+                                CreditBalance: Number(
+                                    unpaid._sum.BalanceAmount || 0
+                                ),
+                                TotalSpent: { decrement: totalRefund },
+                            },
+                        });
                     }
                 }
 
-                // Cash refund (only if customer paid cash/card)
-                const cashRefund = Math.min(totalRefund, Number(sale.PaidAmount));
+                // Cash refund
+                const cashRefund = Math.min(
+                    totalRefund,
+                    Number(sale.PaidAmount)
+                );
                 if (cashRefund > 0) {
                     await this.cashLedger.add(
                         'OUT',
@@ -732,22 +799,22 @@ export class SalesService {
                     );
                 }
 
-                // Get updated customer data
-                const updatedCustomer = sale.CustomerId ? await tx.customers.findUnique({
-                    where: { Id: sale.CustomerId },
-                    select: {
-                        Id: true,
-                        Name: true,
-                        Phone: true,
-                        CreditBalance: true,
-                        CreditLimit: true,
-                        LoyaltyPoints: true,
-                        LoyaltyTier: true,
-                        TotalSpent: true,
-                    },
-                }) : null;
+                const updatedCustomer = sale.CustomerId
+                    ? await tx.customers.findUnique({
+                        where: { Id: sale.CustomerId },
+                        select: {
+                            Id: true,
+                            Name: true,
+                            Phone: true,
+                            CreditBalance: true,
+                            CreditLimit: true,
+                            LoyaltyPoints: true,
+                            LoyaltyTier: true,
+                            TotalSpent: true,
+                        },
+                    })
+                    : null;
 
-                // ✅ Get updated sale with items for response
                 const updatedSale = await tx.sales.findUnique({
                     where: { Id: sale.Id },
                     include: {
@@ -770,7 +837,9 @@ export class SalesService {
                     totalReturned: totalReturned,
                     newBalance: newBalance,
                     sale: updatedSale,
-                    CustomerCreditBalance: updatedCustomer?.CreditBalance ? Number(updatedCustomer.CreditBalance) : 0,
+                    CustomerCreditBalance: updatedCustomer?.CreditBalance
+                        ? Number(updatedCustomer.CreditBalance)
+                        : 0,
                     Customer: updatedCustomer,
                 };
             },
@@ -780,147 +849,156 @@ export class SalesService {
             }
         );
     }
-
     // ============================
     // SIMPLE RETURN (Full Invoice Return)
     // ============================
     async returnInvoice(invoiceNumber: string) {
-        return await this.prisma.$transaction(async (tx) => {
-            const sale = await tx.sales.findFirst({
-                where: { InvoiceNumber: invoiceNumber },
-                include: {
-                    SaleItems: true,
-                    Customers: true,
+    return await this.prisma.$transaction(async (tx) => {
+        const sale = await tx.sales.findFirst({
+            where: { InvoiceNumber: invoiceNumber },
+            include: {
+                SaleItems: true,
+                Customers: true,
+            },
+        });
+
+        if (!sale) {
+            throw new NotFoundException('Invoice not found');
+        }
+
+        if (sale.Status === SaleStatus.FULLY_RETURNED) {
+            throw new BadRequestException('Already fully returned');
+        }
+
+        const totalAmount = Number(sale.TotalAmount);
+
+        // Restore stock
+        for (const item of sale.SaleItems) {
+            await tx.products.update({
+                where: { Id: item.ProductId },
+                data: {
+                    StockQty: { increment: item.Quantity },
                 },
             });
+        }
 
-            if (!sale) {
-                throw new NotFoundException('Invoice not found');
-            }
+        // Create return record
+        const saleReturn = await tx.saleReturns.create({
+            data: {
+                Id: randomUUID(),
+                SaleId: sale.Id,
+                Reason: 'Full return',
+                ReturnedAt: new Date(),
+                ReturnAmount: totalAmount,
+            },
+        });
 
-            if (sale.Status === SaleStatus.FULLY_RETURNED) {
-                throw new BadRequestException('Already fully returned');
-            }
-
-            const totalAmount = Number(sale.TotalAmount);
-
-            // Restore stock
-            for (const item of sale.SaleItems) {
-                await tx.products.update({
-                    where: { Id: item.ProductId },
-                    data: {
-                        StockQty: { increment: item.Quantity },
-                    },
-                });
-            }
-
-            // Create return record
-            const saleReturn = await tx.saleReturns.create({
+        // Create return items
+        for (const item of sale.SaleItems) {
+            await tx.saleReturnItems.create({
                 data: {
                     Id: randomUUID(),
-                    SaleId: sale.Id,
+                    SaleReturnId: saleReturn.Id,
+                    ProductId: item.ProductId,
+                    Quantity: item.Quantity,
+                    UnitPrice: item.UnitPrice,
                     Reason: 'Full return',
-                    ReturnedAt: new Date(),
-                    ReturnAmount: totalAmount,
                 },
             });
+        }
 
-            // Create return items
-            for (const item of sale.SaleItems) {
-                await tx.saleReturnItems.create({
-                    data: {
-                        Id: randomUUID(),
-                        SaleReturnId: saleReturn.Id,
-                        ProductId: item.ProductId,
-                        Quantity: item.Quantity,
-                        UnitPrice: item.UnitPrice,
-                        Reason: 'Full return',
-                    },
-                });
-            }
-
-            // Update sale
-            await tx.sales.update({
-                where: { Id: sale.Id },
-                data: {
-                    Status: SaleStatus.FULLY_RETURNED,
-                    PaidAmount: 0,
-                    BalanceAmount: 0,
-                    IsCreditSale: false,
-                    HasReturns: true,
-                    ReturnedAmount: totalAmount,
-                },
-            });
-
-            // Customer ledger and credit balance update
-            if (sale.CustomerId) {
-                // Create customer ledger entry for the return
-                await tx.customerLedgerEntries.create({
-                    data: {
-                        Id: randomUUID(),
-                        CustomerId: sale.CustomerId,
-                        SaleId: sale.Id,
-                        SaleReturnId: saleReturn.Id,
-                        Debit: totalAmount,
-                        Credit: 0,
-                        Type: 'RETURN',
-                        CreatedAt: new Date(),
-                    },
-                });
-
-                // UPDATE CUSTOMER'S CREDIT BALANCE (DECREASE IT)
-                if (sale.Customers) {
-                    const currentBalance = Number(sale.Customers.CreditBalance) || 0;
-                    const refundAmount = Math.min(totalAmount, currentBalance);
-
-                    if (refundAmount > 0) {
-                        await tx.customers.update({
-                            where: { Id: sale.CustomerId },
-                            data: {
-                                CreditBalance: { decrement: refundAmount },
-                                TotalSpent: { decrement: totalAmount },
-                            },
-                        });
-                    }
-                }
-            }
-
-            // Cash refund
-            const refundAmount = Number(sale.PaidAmount);
-            if (refundAmount > 0) {
-                await this.cashLedger.add(
-                    'OUT',
-                    refundAmount,
-                    'RETURN',
-                    invoiceNumber,
-                    `Full refund for ${invoiceNumber}`
-                );
-            }
-
-            // Get updated customer data
-            const updatedCustomer = sale.CustomerId ? await tx.customers.findUnique({
-                where: { Id: sale.CustomerId },
-                select: {
-                    Id: true,
-                    Name: true,
-                    Phone: true,
-                    CreditBalance: true,
-                    CreditLimit: true,
-                    LoyaltyPoints: true,
-                    LoyaltyTier: true,
-                    TotalSpent: true,
-                },
-            }) : null;
-
-            return {
-                message: 'Return processed',
-                invoiceNumber,
-                CustomerCreditBalance: updatedCustomer?.CreditBalance ? Number(updatedCustomer.CreditBalance) : 0,
-                Customer: updatedCustomer,
-            };
+        // Update sale — zeroed out
+        await tx.sales.update({
+            where: { Id: sale.Id },
+            data: {
+                Status: SaleStatus.FULLY_RETURNED,
+                PaidAmount: 0,
+                BalanceAmount: 0,
+                IsCreditSale: false,
+                HasReturns: true,
+                ReturnedAmount: totalAmount,
+                SubTotal: 0,
+                InvoiceDiscount: 0,
+                TotalAmount: 0,
+            },
         });
-    }
 
+        // Customer ledger + credit balance
+        if (sale.CustomerId) {
+            await tx.customerLedgerEntries.create({
+                data: {
+                    Id: randomUUID(),
+                    CustomerId: sale.CustomerId,
+                    SaleId: sale.Id,
+                    SaleReturnId: saleReturn.Id,
+                    Debit: totalAmount,
+                    Credit: 0,
+                    Type: 'RETURN',
+                    CreatedAt: new Date(),
+                },
+            });
+
+            if (sale.Customers) {
+                // ✅ Recalculate from unpaid sales (self-healing)
+                const unpaid = await tx.sales.aggregate({
+                    where: {
+                        CustomerId: sale.CustomerId,
+                        BalanceAmount: { gt: 0 },
+                        Status: { not: 4 },
+                    },
+                    _sum: { BalanceAmount: true },
+                });
+
+                await tx.customers.update({
+                    where: { Id: sale.CustomerId },
+                    data: {
+                        CreditBalance: Number(
+                            unpaid._sum.BalanceAmount || 0
+                        ),
+                        TotalSpent: { decrement: totalAmount },
+                    },
+                });
+            }
+        }
+
+        // Cash refund — refund what the customer actually paid
+        const refundAmount = Number(sale.PaidAmount);
+        if (refundAmount > 0) {
+            await this.cashLedger.add(
+                'OUT',
+                refundAmount,
+                'RETURN',
+                invoiceNumber,
+                `Full refund for ${invoiceNumber}`
+            );
+        }
+
+        const updatedCustomer = sale.CustomerId
+            ? await tx.customers.findUnique({
+                  where: { Id: sale.CustomerId },
+                  select: {
+                      Id: true,
+                      Name: true,
+                      Phone: true,
+                      CreditBalance: true,
+                      CreditLimit: true,
+                      LoyaltyPoints: true,
+                      LoyaltyTier: true,
+                      TotalSpent: true,
+                  },
+              })
+            : null;
+
+        return {
+            message: 'Return processed',
+            invoiceNumber,
+            CustomerCreditBalance: updatedCustomer?.CreditBalance
+                ? Number(updatedCustomer.CreditBalance)
+                : 0,
+            Customer: updatedCustomer,
+        };
+    });
+}
     // ============================
     // REPLACEMENT
     // ============================
@@ -1918,5 +1996,673 @@ export class SalesService {
 
         return totalBalance;
     }
+
+    async recordCreditCheque(dto: RecordCreditChequeDto) {
+        return await this.prisma.$transaction(
+            async (tx) => {
+                const sale = await tx.sales.findUnique({
+                    where: { Id: dto.saleId },
+                    include: { Customers: true },
+                });
+
+                if (!sale) {
+                    throw new NotFoundException('Sale not found');
+                }
+
+                if (dto.amount <= 0) {
+                    throw new BadRequestException('Invalid amount');
+                }
+
+                const balance = Number(sale.BalanceAmount);
+                if (dto.amount > balance) {
+                    throw new BadRequestException(
+                        `Exceeds balance. Balance: ${balance}`
+                    );
+                }
+
+                if (!dto.chequeNumber || !dto.chequeDate) {
+                    throw new BadRequestException(
+                        'Cheque number and date are required'
+                    );
+                }
+
+                // 1. Create pending cheque payment row
+                const payment = await tx.creditPayments.create({
+                    data: {
+                        Id: randomUUID(),
+                        SaleId: sale.Id,
+                        Amount: dto.amount,
+                        PaidAt: new Date(),
+                        Note: dto.note || 'Cheque payment received',
+                        PaymentMethod: 'cheque',
+                        Reference: dto.chequeNumber,
+                        ChequeDate: new Date(dto.chequeDate),
+                        Status: 'pending',
+                        ClearedAt: null,
+                    },
+                });
+
+                // 2. Reduce sale balance / increase paid
+                const newPaid = Number(sale.PaidAmount) + dto.amount;
+                const newBalance = Math.max(0, balance - dto.amount);
+
+                await tx.sales.update({
+                    where: { Id: sale.Id },
+                    data: {
+                        PaidAmount: newPaid,
+                        BalanceAmount: newBalance,
+                        IsCreditSale: newBalance > 0,
+                    },
+                });
+
+                // 3. Customer ledger entry (pending)
+                if (sale.CustomerId) {
+                    await tx.customerLedgerEntries.create({
+                        data: {
+                            Id: randomUUID(),
+                            CustomerId: sale.CustomerId,
+                            SaleId: sale.Id,
+                            Debit: dto.amount,
+                            Credit: 0,
+                            Type: 'CHEQUE_PENDING',
+                            CreatedAt: new Date(),
+                        },
+                    });
+                }
+
+                // ⚠️ NO cash ledger entry yet
+                // ⚠️ NO salePayments row yet
+
+                return {
+                    message: 'Cheque recorded — awaiting clearance',
+                    PaymentId: payment.Id,
+                    SaleId: sale.Id,
+                    InvoiceNumber: sale.InvoiceNumber,
+                    Amount: dto.amount,
+                    ChequeNumber: dto.chequeNumber,
+                    ChequeDate: dto.chequeDate,
+                    Status: 'pending',
+                    NewPaidAmount: newPaid,
+                    NewBalanceAmount: newBalance,
+                };
+            },
+            { timeout: 30000, maxWait: 15000 }
+        );
+    }
+
+    // ============================================================
+    // ✅ GET INCOMING CHEQUES (with optional status filter)
+    // ============================================================
+    async getIncomingCheques(status?: string) {
+        const where: any = { PaymentMethod: 'cheque' };
+        if (status) where.Status = status;
+
+        const cheques = await this.prisma.creditPayments.findMany({
+            where,
+            include: {
+                Sales: {
+                    include: {
+                        Customers: true,
+                    },
+                },
+            },
+            orderBy: { PaidAt: 'desc' },
+        });
+
+        return cheques.map((c) => ({
+            Id: c.Id,
+            SaleId: c.SaleId,
+            InvoiceNumber: c.Sales?.InvoiceNumber || null,
+            CustomerId: c.Sales?.CustomerId || null,
+            CustomerName: c.Sales?.Customers?.Name || 'Walk-in Customer',
+            CustomerPhone: c.Sales?.Customers?.Phone || null,
+            Amount: Number(c.Amount),
+            PaymentMethod: c.PaymentMethod,
+            Reference: c.Reference,
+            ChequeDate: c.ChequeDate,
+            Status: c.Status,
+            ClearedAt: c.ClearedAt,
+            PaidAt: c.PaidAt,
+            Note: c.Note,
+        }));
+    }
+
+    // ============================================================
+    // ✅ CLEAR A PENDING CHEQUE
+    // ============================================================
+    async clearCreditCheque(paymentId: string) {
+        return await this.prisma.$transaction(
+            async (tx) => {
+                const payment = await tx.creditPayments.findUnique({
+                    where: { Id: paymentId },
+                    include: { Sales: true },
+                });
+
+                if (!payment) {
+                    throw new NotFoundException('Cheque payment not found');
+                }
+
+                if (payment.PaymentMethod !== 'cheque') {
+                    throw new BadRequestException('This payment is not a cheque');
+                }
+
+                if (payment.Status === 'cleared') {
+                    throw new BadRequestException('Cheque already cleared');
+                }
+
+                if (payment.Status === 'bounced') {
+                    throw new BadRequestException(
+                        'Cheque was bounced — cannot clear'
+                    );
+                }
+
+                const amount = Number(payment.Amount);
+
+                // 1. Mark cleared
+                const updated = await tx.creditPayments.update({
+                    where: { Id: paymentId },
+                    data: {
+                        Status: 'cleared',
+                        ClearedAt: new Date(),
+                    },
+                });
+
+                // 2. Post to cash ledger
+                await this.cashLedger.add(
+                    'IN',
+                    amount,
+                    'CREDIT_CHEQUE_CLEARED',
+                    payment.Sales.InvoiceNumber,
+                    `Cheque cleared for ${payment.Sales.InvoiceNumber}${payment.Reference ? ` (Cheque #${payment.Reference})` : ''
+                    }`
+                );
+
+                // 3. Record in sale payments now that it's cleared
+                await tx.salePayments.create({
+                    data: {
+                        Id: randomUUID(),
+                        SaleId: payment.SaleId,
+                        PaymentMode: 'cheque',
+                        Amount: amount,
+                        PaidAt: new Date(),
+                        Status: 'completed',
+                        Reference: payment.Reference || null,
+                    },
+                });
+
+                return {
+                    Id: updated.Id,
+                    Status: updated.Status,
+                    ClearedAt: updated.ClearedAt,
+                    message: `Cheque cleared — Rs ${amount} posted to cash ledger`,
+                };
+            },
+            { timeout: 30000, maxWait: 15000 }
+        );
+    }
+
+    // ============================================================
+    // ✅ BOUNCE A PENDING CHEQUE
+    // ============================================================
+    async bounceCreditCheque(paymentId: string, reason?: string) {
+        return await this.prisma.$transaction(
+            async (tx) => {
+                const payment = await tx.creditPayments.findUnique({
+                    where: { Id: paymentId },
+                    include: { Sales: true },
+                });
+
+                if (!payment) {
+                    throw new NotFoundException('Cheque payment not found');
+                }
+
+                if (payment.PaymentMethod !== 'cheque') {
+                    throw new BadRequestException('This payment is not a cheque');
+                }
+
+                if (payment.Status === 'cleared') {
+                    throw new BadRequestException('Cannot bounce a cleared cheque');
+                }
+
+                if (payment.Status === 'bounced') {
+                    throw new BadRequestException(
+                        'Cheque already marked as bounced'
+                    );
+                }
+
+                const amount = Number(payment.Amount);
+                const sale = payment.Sales;
+
+                // 1. Reverse sale paid / balance
+                const newPaid = Math.max(0, Number(sale.PaidAmount) - amount);
+                const newBalance = Number(sale.BalanceAmount) + amount;
+
+                await tx.sales.update({
+                    where: { Id: sale.Id },
+                    data: {
+                        PaidAmount: newPaid,
+                        BalanceAmount: newBalance,
+                        IsCreditSale: true,
+                    },
+                });
+
+                // 2. Mark payment bounced
+                const combinedNote = reason
+                    ? `${payment.Note || ''} | BOUNCED: ${reason}`.trim()
+                    : `${payment.Note || ''} | BOUNCED`.trim();
+
+                await tx.creditPayments.update({
+                    where: { Id: paymentId },
+                    data: {
+                        Status: 'bounced',
+                        ClearedAt: null,
+                        Note: combinedNote,
+                    },
+                });
+
+                // 3. Reverse customer ledger
+                if (sale.CustomerId) {
+                    await tx.customerLedgerEntries.create({
+                        data: {
+                            Id: randomUUID(),
+                            CustomerId: sale.CustomerId,
+                            SaleId: sale.Id,
+                            Debit: 0,
+                            Credit: amount,
+                            Type: 'CHEQUE_BOUNCED',
+                            CreatedAt: new Date(),
+                        },
+                    });
+                }
+
+                return {
+                    Id: paymentId,
+                    Status: 'bounced',
+                    NewPaidAmount: newPaid,
+                    NewBalanceAmount: newBalance,
+                    message: `Cheque bounced — Rs ${amount} re-added to outstanding`,
+                };
+            },
+            { timeout: 30000, maxWait: 15000 }
+        );
+    }
+
+
+    async recordBulkCreditCheque(dto: RecordBulkCreditChequeDto) {
+        return await this.prisma.$transaction(
+            async (tx) => {
+                // 1. Fetch all selected sales, verify they belong to the same customer
+                const sales = await tx.sales.findMany({
+                    where: { Id: { in: dto.saleIds } },
+                    include: { Customers: true },
+                });
+
+                if (sales.length !== dto.saleIds.length) {
+                    throw new NotFoundException('One or more sales not found');
+                }
+
+                const customerIds = new Set(
+                    sales.map((s) => s.CustomerId).filter((id) => !!id)
+                );
+
+                if (customerIds.size === 0) {
+                    throw new BadRequestException(
+                        'Selected invoices must belong to a customer'
+                    );
+                }
+
+                if (customerIds.size > 1) {
+                    throw new BadRequestException(
+                        'All selected invoices must belong to the same customer'
+                    );
+                }
+
+                // 2. Verify every sale has an outstanding balance
+                const emptyBalances = sales.filter(
+                    (s) => Number(s.BalanceAmount) <= 0
+                );
+                if (emptyBalances.length > 0) {
+                    throw new BadRequestException(
+                        `Some invoices have no outstanding balance: ${emptyBalances
+                            .map((s) => s.InvoiceNumber)
+                            .join(', ')}`
+                    );
+                }
+
+                // 3. Compute total = sum of balances
+                const totalAmount = sales.reduce(
+                    (sum, s) => sum + Number(s.BalanceAmount),
+                    0
+                );
+
+                if (!dto.chequeNumber || !dto.chequeDate) {
+                    throw new BadRequestException(
+                        'Cheque number and date are required'
+                    );
+                }
+
+                const chequeDate = new Date(dto.chequeDate);
+                const customerId = sales[0].CustomerId!;
+
+                // 4. Create one CreditPayments row per sale + reduce balance
+                const createdPayments: any[] = [];
+
+                for (const sale of sales) {
+                    const amount = Number(sale.BalanceAmount);
+                    const newPaid = Number(sale.PaidAmount) + amount;
+                    const newBalance = 0; // fully settled per Option X
+
+                    const payment = await tx.creditPayments.create({
+                        data: {
+                            Id: randomUUID(),
+                            SaleId: sale.Id,
+                            Amount: amount,
+                            PaidAt: new Date(),
+                            Note:
+                                dto.note ||
+                                `Cheque payment — ${sales.length} invoice(s)`,
+                            PaymentMethod: 'cheque',
+                            Reference: dto.chequeNumber,
+                            ChequeDate: chequeDate,
+                            Status: 'pending',
+                            ClearedAt: null,
+                        },
+                    });
+
+                    await tx.sales.update({
+                        where: { Id: sale.Id },
+                        data: {
+                            PaidAmount: newPaid,
+                            BalanceAmount: newBalance,
+                            IsCreditSale: false,
+                        },
+                    });
+
+                    await tx.customerLedgerEntries.create({
+                        data: {
+                            Id: randomUUID(),
+                            CustomerId: customerId,
+                            SaleId: sale.Id,
+                            Debit: amount,
+                            Credit: 0,
+                            Type: 'CHEQUE_PENDING',
+                            CreatedAt: new Date(),
+                        },
+                    });
+
+                    createdPayments.push({
+                        PaymentId: payment.Id,
+                        SaleId: sale.Id,
+                        InvoiceNumber: sale.InvoiceNumber,
+                        Amount: amount,
+                    });
+                }
+
+                return {
+                    message: `Cheque recorded against ${sales.length} invoice(s) — awaiting clearance`,
+                    ChequeNumber: dto.chequeNumber,
+                    ChequeDate: dto.chequeDate,
+                    TotalAmount: totalAmount,
+                    InvoiceCount: sales.length,
+                    Payments: createdPayments,
+                    Status: 'pending',
+                };
+            },
+            { timeout: 30000, maxWait: 15000 }
+        );
+    }
+
+    // ============================================================
+    // ✅ CLEAR ALL PENDING CHEQUE ROWS SHARING A REFERENCE
+    // ============================================================
+    async clearCreditChequesByReference(reference: string) {
+        return await this.prisma.$transaction(
+            async (tx) => {
+                const rows = await tx.creditPayments.findMany({
+                    where: {
+                        PaymentMethod: 'cheque',
+                        Reference: reference,
+                    },
+                    include: { Sales: true },
+                });
+
+                if (rows.length === 0) {
+                    throw new NotFoundException(
+                        `No cheque payments found with reference ${reference}`
+                    );
+                }
+
+                const alreadyCleared = rows.filter((r) => r.Status === 'cleared');
+                if (alreadyCleared.length === rows.length) {
+                    throw new BadRequestException('Cheque already cleared');
+                }
+
+                const bounced = rows.filter((r) => r.Status === 'bounced');
+                if (bounced.length > 0) {
+                    throw new BadRequestException(
+                        'Cheque was bounced — cannot clear'
+                    );
+                }
+
+                let totalCleared = 0;
+                let clearedCount = 0;
+
+                for (const row of rows) {
+                    if (row.Status !== 'pending') continue;
+
+                    const amount = Number(row.Amount);
+                    totalCleared += amount;
+                    clearedCount++;
+
+                    await tx.creditPayments.update({
+                        where: { Id: row.Id },
+                        data: {
+                            Status: 'cleared',
+                            ClearedAt: new Date(),
+                        },
+                    });
+
+                    await this.cashLedger.add(
+                        'IN',
+                        amount,
+                        'CREDIT_CHEQUE_CLEARED',
+                        row.Sales.InvoiceNumber,
+                        `Cheque cleared for ${row.Sales.InvoiceNumber} (Cheque #${reference})`
+                    );
+
+                    await tx.salePayments.create({
+                        data: {
+                            Id: randomUUID(),
+                            SaleId: row.SaleId,
+                            PaymentMode: 'cheque',
+                            Amount: amount,
+                            PaidAt: new Date(),
+                            Status: 'completed',
+                            Reference: reference,
+                        },
+                    });
+                }
+
+                return {
+                    ChequeNumber: reference,
+                    InvoicesCleared: clearedCount,
+                    TotalCleared: totalCleared,
+                    message: `Cheque cleared — Rs ${totalCleared} posted across ${clearedCount} invoice(s)`,
+                };
+            },
+            { timeout: 30000, maxWait: 15000 }
+        );
+    }
+
+    // ============================================================
+    // ✅ BOUNCE ALL PENDING CHEQUE ROWS SHARING A REFERENCE
+    // ============================================================
+    async bounceCreditChequesByReference(reference: string, reason?: string) {
+        return await this.prisma.$transaction(
+            async (tx) => {
+                const rows = await tx.creditPayments.findMany({
+                    where: {
+                        PaymentMethod: 'cheque',
+                        Reference: reference,
+                    },
+                    include: { Sales: true },
+                });
+
+                if (rows.length === 0) {
+                    throw new NotFoundException(
+                        `No cheque payments found with reference ${reference}`
+                    );
+                }
+
+                const cleared = rows.filter((r) => r.Status === 'cleared');
+                if (cleared.length > 0) {
+                    throw new BadRequestException(
+                        'Cannot bounce a cleared cheque'
+                    );
+                }
+
+                const alreadyBounced = rows.filter((r) => r.Status === 'bounced');
+                if (alreadyBounced.length === rows.length) {
+                    throw new BadRequestException(
+                        'Cheque already marked as bounced'
+                    );
+                }
+
+                let totalReversed = 0;
+                let bouncedCount = 0;
+
+                for (const row of rows) {
+                    if (row.Status !== 'pending') continue;
+
+                    const amount = Number(row.Amount);
+                    const sale = row.Sales;
+                    totalReversed += amount;
+                    bouncedCount++;
+
+                    // Reverse sale
+                    const newPaid = Math.max(
+                        0,
+                        Number(sale.PaidAmount) - amount
+                    );
+                    const newBalance = Number(sale.BalanceAmount) + amount;
+
+                    await tx.sales.update({
+                        where: { Id: sale.Id },
+                        data: {
+                            PaidAmount: newPaid,
+                            BalanceAmount: newBalance,
+                            IsCreditSale: true,
+                        },
+                    });
+
+                    const combinedNote = reason
+                        ? `${row.Note || ''} | BOUNCED: ${reason}`.trim()
+                        : `${row.Note || ''} | BOUNCED`.trim();
+
+                    await tx.creditPayments.update({
+                        where: { Id: row.Id },
+                        data: {
+                            Status: 'bounced',
+                            ClearedAt: null,
+                            Note: combinedNote,
+                        },
+                    });
+
+                    if (sale.CustomerId) {
+                        await tx.customerLedgerEntries.create({
+                            data: {
+                                Id: randomUUID(),
+                                CustomerId: sale.CustomerId,
+                                SaleId: sale.Id,
+                                Debit: 0,
+                                Credit: amount,
+                                Type: 'CHEQUE_BOUNCED',
+                                CreatedAt: new Date(),
+                            },
+                        });
+                    }
+                }
+
+                return {
+                    ChequeNumber: reference,
+                    InvoicesReversed: bouncedCount,
+                    TotalReversed: totalReversed,
+                    message: `Cheque bounced — Rs ${totalReversed} re-added to outstanding across ${bouncedCount} invoice(s)`,
+                };
+            },
+            { timeout: 30000, maxWait: 15000 }
+        );
+    }
+
+
+    async getAllReturns(filters?: {
+    startDate?: Date;
+    endDate?: Date;
+    customerId?: string;
+    productId?: string;
+}) {
+    const where: any = {};
+
+    if (filters?.startDate || filters?.endDate) {
+        where.ReturnedAt = {};
+        if (filters.startDate) where.ReturnedAt.gte = filters.startDate;
+        if (filters.endDate) {
+            const end = new Date(filters.endDate);
+            end.setUTCDate(end.getUTCDate() + 1);
+            where.ReturnedAt.lt = end;
+        }
+    }
+
+    if (filters?.customerId) {
+        where.Sales = { CustomerId: filters.customerId };
+    }
+
+    const returns = await this.prisma.saleReturns.findMany({
+        where,
+        include: {
+            Sales: {
+                include: {
+                    Customers: true,
+                },
+            },
+            SaleReturnItems: {
+                include: {
+                    Products: true,
+                },
+            },
+        },
+        orderBy: {
+            ReturnedAt: 'desc',
+        },
+    });
+
+    return returns.map((r) => ({
+        Id: r.Id,
+        ReturnedAt: r.ReturnedAt,
+        Reason: r.Reason,
+        ReturnAmount: Number(r.ReturnAmount),
+        RefundAmount: Number(r.RefundAmount || 0),
+        RefundMethod: r.RefundMethod,
+
+        SaleId: r.SaleId,
+        InvoiceNumber: r.Sales?.InvoiceNumber || null,
+        SaleDate: r.Sales?.CreatedAt || null,
+
+        CustomerId: r.Sales?.CustomerId || null,
+        CustomerName: r.Sales?.Customers?.Name || 'Walk-in Customer',
+        CustomerPhone: r.Sales?.Customers?.Phone || null,
+
+        Items: r.SaleReturnItems.map((ri) => ({
+            ProductId: ri.ProductId,
+            ProductName: ri.Products?.Name || 'Unknown',
+            ProductBarcode: ri.Products?.Barcode || null,
+            Quantity: ri.Quantity,
+            UnitPrice: Number(ri.UnitPrice),
+            Reason: ri.Reason,
+            LineTotal: Number(ri.UnitPrice) * ri.Quantity,
+        })),
+    }));
+}
+
 
 }

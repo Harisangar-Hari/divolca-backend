@@ -9,167 +9,97 @@ import {
     Patch,
     HttpCode,
     HttpStatus,
-    Delete
+    Delete,
 } from '@nestjs/common';
 
 import { CustomersService } from './customers.service';
-
 import { CreateCustomerDto } from './dto/create-customer.dto';
 import { PayCustomerCreditDto } from './dto/pay-customer-credit.dto';
 import { UpdateCustomerDto } from './dto/update-customer.dto';
+import { Permissions } from '../auth/decorators/permissions.decorator';
+import { ApiBearerAuth } from '@nestjs/swagger';
+import { UserRole } from 'src/auth/auth.service';
+import { Roles } from 'src/auth/decorators/roles.decorator';
 
-
-
+@ApiBearerAuth('JWT-auth')
 @Controller('customers')
 export class CustomersController {
-
-
-    constructor(
-        private readonly customersService: CustomersService
-    ) { }
-
-
-
-    // =========================
-    // GET ALL CUSTOMERS
-    // =========================
+    constructor(private readonly customersService: CustomersService) { }
 
     @Get()
+    @Permissions('canViewCustomers')
     async getAllCustomers() {
-
         return this.customersService.getAllCustomers();
-
     }
-
-     @Delete(':id')
-    @HttpCode(HttpStatus.OK)
-    async deleteCustomer(
-        @Param('id') id: string
-    ) {
-        return this.customersService.deleteCustomer(id);
-    }
-
-
-    // =========================
-    // CREDIT SUMMARY
-    // =========================
 
     @Get('credit-summary')
+    @Permissions('canViewCustomers')
     async getCreditSummary() {
-
         return this.customersService.getCreditSummary();
-
     }
-
-
-
-    // =========================
-    // SEARCH CUSTOMER
-    // =========================
 
     @Get('search')
-    async searchCustomers(
-        @Query('q') q: string
-    ) {
-
+    @Permissions('canViewCustomers')
+    async searchCustomers(@Query('q') q: string) {
         return this.customersService.searchCustomers(q);
-
     }
-
-
-
-    // =========================
-    // CREATE CUSTOMER
-    // =========================
 
     @Post()
-    async createCustomer(
-        @Body() dto: CreateCustomerDto
-    ) {
-
+    @Permissions('canCreateCustomers')
+    async createCustomer(@Body() dto: CreateCustomerDto) {
         return this.customersService.createCustomer(dto);
-
     }
-
-
-
-    // =========================
-    // PAY CUSTOMER CREDIT
-    // =========================
 
     @Post('pay-customer-credit')
-    async payCustomerCredit(
-        @Body() dto: PayCustomerCreditDto
-    ) {
-
+    @Permissions('canManageCreditPayments')
+    async payCustomerCredit(@Body() dto: PayCustomerCreditDto) {
         return this.customersService.payCustomerCredit(dto);
-
     }
-
-
-
-    // =========================
-    // CUSTOMER INVOICES
-    // IMPORTANT:
-    // Keep before :id route
-    // =========================
 
     @Get(':id/invoices')
-    async getCustomerInvoices(
-        @Param('id') id: string
-    ) {
-
+    @Permissions('canViewCustomers')
+    async getCustomerInvoices(@Param('id') id: string) {
         return this.customersService.getCustomerInvoices(id);
-
     }
-
-
-
-    // =========================
-    // CUSTOMER DETAILS
-    // =========================
 
     @Get(':id')
-    async getCustomerById(
-        @Param('id') id: string
-    ) {
-
+    @Permissions('canViewCustomers')
+    async getCustomerById(@Param('id') id: string) {
         return this.customersService.getCustomerById(id);
-
     }
 
-      @Put(':id')
+    @Put(':id')
+    @Permissions('canEditCustomers')
     async updateCustomer(
         @Param('id') id: string,
-        @Body() dto: UpdateCustomerDto
+        @Body() dto: UpdateCustomerDto,
     ) {
         return this.customersService.updateCustomer(id, dto);
     }
 
-    // =========================
-    // ✅ TOGGLE CUSTOMER STATUS (NEW)
-    // =========================
     @Patch(':id/toggle-status')
+    @Permissions('canEditCustomers')
     @HttpCode(HttpStatus.OK)
-    async toggleCustomerStatus(
-        @Param('id') id: string
-    ) {
+    async toggleCustomerStatus(@Param('id') id: string) {
         return this.customersService.toggleCustomerStatus(id);
     }
 
-    // =========================
-    // ✅ TOGGLE BLOCK CUSTOMER (NEW)
-    // =========================
     @Patch(':id/toggle-block')
+    @Permissions('canEditCustomers')
     @HttpCode(HttpStatus.OK)
     async toggleBlockCustomer(
         @Param('id') id: string,
-        @Body() body?: { reason?: string }
+        @Body() body?: { reason?: string },
     ) {
         return this.customersService.toggleBlockCustomer(id, body?.reason);
     }
 
-
-
-
+    @ApiBearerAuth()
+    @Roles(UserRole.ADMIN)
+    @Delete(':id')
+    @Permissions('canDeleteCustomers')
+    @HttpCode(HttpStatus.OK)
+    async deleteCustomer(@Param('id') id: string) {
+        return this.customersService.deleteCustomer(id);
+    }
 }

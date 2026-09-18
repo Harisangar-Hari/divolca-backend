@@ -1,3 +1,4 @@
+//src/sales/dto/checkout.dto.ts
 import { IsArray, IsEnum, IsNumber, IsOptional, IsString, IsUUID, Min, ValidateNested } from 'class-validator';
 import { Type } from 'class-transformer';
 
