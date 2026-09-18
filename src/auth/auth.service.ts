@@ -313,7 +313,7 @@ export class AuthService {
     // =========================
     async logout(userId: string) {
         // Optional: Track logout time or invalidate tokens
-        return { message: 'Logged out successfully' };
+        return { message: 'Logged out successfully ' };
     }
 
     // =========================
