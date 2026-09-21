@@ -599,57 +599,65 @@ export class CustomersService {
 
 
   async deleteCustomer(id: string) {
-    // 1. Check if customer exists
-    const customer = await this.prisma.customers.findUnique({
-      where: { Id: id },
-      include: {
-        Sales: {
-          where: {
-            BalanceAmount: { gt: 0 }
-          }
+    return await this.prisma.$transaction(
+      async (tx) => {
+        // 1. Verify exists
+        const customer = await tx.customers.findUnique({
+          where: { Id: id },
+        });
+
+        if (!customer) {
+          throw new NotFoundException('Customer not found');
         }
+
+        // 2. Gather counts BEFORE deleting, so we can report them
+        const [salesCount, ledgerCount, paymentsCount, returnsCount] =
+          await Promise.all([
+            tx.sales.count({ where: { CustomerId: id } }),
+            tx.customerLedgerEntries.count({
+              where: { CustomerId: id },
+            }),
+            tx.salePayments.count({
+              where: { Sales: { CustomerId: id } },
+            }),
+            tx.saleReturns.count({
+              where: { Sales: { CustomerId: id } },
+            }),
+          ]);
+
+        // 3. Delete ledger entries FIRST
+        //    (they reference Sales / SaleReturns with NoAction — must clear before parent deletes)
+        await tx.customerLedgerEntries.deleteMany({
+          where: { CustomerId: id },
+        });
+
+        // 4. Delete all sales → cascades to:
+        //    SaleItems, SalePayments, CreditPayments, SaleReturns, SaleReturnItems
+        await tx.sales.deleteMany({
+          where: { CustomerId: id },
+        });
+
+        // 5. Finally delete the customer
+        await tx.customers.delete({
+          where: { Id: id },
+        });
+
+        return {
+          message: `Customer "${customer.Name}" and all related records deleted`,
+          id: customer.Id,
+          deleted: {
+            sales: salesCount,
+            payments: paymentsCount,
+            returns: returnsCount,
+            ledgerEntries: ledgerCount,
+          },
+        };
+      },
+      {
+        timeout: 30000,
+        maxWait: 15000,
       }
-    });
-
-    if (!customer) {
-      throw new NotFoundException('Customer not found');
-    }
-
-    // 2. Check if customer has outstanding balance
-    if (customer.Sales.length > 0) {
-      const totalBalance = customer.Sales.reduce(
-        (sum, sale) => sum + Number(sale.BalanceAmount),
-        0
-      );
-
-      if (totalBalance > 0) {
-        throw new BadRequestException(
-          `Cannot delete customer with outstanding balance of Rs ${totalBalance.toFixed(2)}. Please clear all dues first.`
-        );
-      }
-    }
-
-    // 3. Check if customer has any sales (even paid ones)
-    const hasSales = await this.prisma.sales.findFirst({
-      where: { CustomerId: id }
-    });
-
-    if (hasSales) {
-      throw new BadRequestException(
-        'Cannot delete customer with existing sales history. You can deactivate the customer instead.'
-      );
-    }
-
-    // 4. Delete customer (soft delete - mark as inactive)
-    // Or actually delete if you prefer
-    await this.prisma.customers.delete({
-      where: { Id: id }
-    });
-
-    return {
-      message: `Customer ${customer.Name} deleted successfully`,
-      id: customer.Id
-    };
+    );
   }
 
 

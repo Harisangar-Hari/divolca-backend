@@ -174,7 +174,20 @@ export class ChequeDashboardService {
 
             });
 
-
+        const bounced =
+            await this.prisma.supplierPayments.findMany({
+                where: {
+                    PaymentMethod: "Cheque",
+                    Status: "Bounced"
+                },
+                include: {
+                    Purchases: {
+                        include: {
+                            Suppliers: true
+                        }
+                    }
+                }
+            });
 
 
         return {
@@ -195,7 +208,8 @@ export class ChequeDashboardService {
 
                 dueToday: dueToday.length,
 
-                cleared: cleared.length
+                cleared: cleared.length,
+                bounced: bounced.length,
 
             },
 
@@ -214,7 +228,9 @@ export class ChequeDashboardService {
 
 
             cleared:
-                this.formatClearedList(cleared)
+                this.formatClearedList(cleared),
+
+            bounced: this.formatBouncedList(bounced),
 
         };
 
@@ -485,6 +501,19 @@ export class ChequeDashboardService {
         }));
 
 
+    }
+
+    private formatBouncedList(data: any[]) {
+        return data.map(x => ({
+            Id: x.Id,
+            Amount: x.Amount,
+            ChequeNumber: x.ChequeNumber,
+            ChequeDate: x.ChequeDate,
+            ClearedAt: x.ClearedAt,
+            Notes: x.Notes,
+            supplier: x.Purchases.Suppliers.Name,
+            invoice: x.Purchases.InvoiceNumber,
+        }));
     }
 
 

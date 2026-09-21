@@ -6,6 +6,8 @@ import {
     Delete,
     Body,
     Param,
+    HttpCode,
+    HttpStatus,
 } from '@nestjs/common';
 
 import { SuppliersService } from './suppliers.service';
@@ -16,7 +18,7 @@ import { Permissions } from '../auth/decorators/permissions.decorator';
 
 @Controller('suppliers')
 export class SuppliersController {
-    constructor(private readonly suppliersService: SuppliersService) {}
+    constructor(private readonly suppliersService: SuppliersService) { }
 
     @Get()
     @Permissions('canViewSuppliers')
@@ -76,5 +78,25 @@ export class SuppliersController {
     @Permissions('canManageSupplierCheques')
     clearCheque(@Param('id') id: string) {
         return this.suppliersService.clearCheque(id);
+    }
+
+    @Post('cheque/clear-by-number/:chequeNumber')
+    @Permissions('canManageSupplierCheques')
+    clearChequeByNumber(@Param('chequeNumber') chequeNumber: string) {
+        return this.suppliersService.clearChequeByNumber(chequeNumber);
+    }
+
+
+    @Post('cheque/bounce-by-number/:chequeNumber')
+    @Permissions('canManageSupplierCheques')
+    @HttpCode(HttpStatus.OK)
+    async bounceChequeByNumber(
+        @Param('chequeNumber') chequeNumber: string,
+        @Body() body?: { reason?: string }
+    ) {
+        return this.suppliersService.bounceChequeByNumber(
+            chequeNumber,
+            body?.reason
+        );
     }
 }

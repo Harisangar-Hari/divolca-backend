@@ -281,26 +281,23 @@ export class SalesService {
                     const points = Math.floor(finalTotal / 2000);
 
                     // Calculate credit balance update
-                    let creditBalanceUpdate = 0;
+                    // ✅ Recalculate CreditBalance from ALL of this customer's unpaid sales
+                    // (covers cash, card, AND credit — any sale with an outstanding balance)
+                    const unpaid = await tx.sales.aggregate({
+                        where: {
+                            CustomerId: customer.Id,
+                            BalanceAmount: { gt: 0 },
+                            Status: { not: 4 }, // exclude cancelled
+                        },
+                        _sum: { BalanceAmount: true },
+                    });
 
-                    if (dto.paymentMode === PaymentMode.CREDIT) {
-                        // For credit sales: increase credit balance by the remaining balance
-                        creditBalanceUpdate = balance; // Positive number to add
-                    } else if (dto.paymentMode === PaymentMode.CASH || dto.paymentMode === PaymentMode.CARD) {
-                        // For cash/card sales: no credit balance change
-                        creditBalanceUpdate = 0;
-                    }
-
-                    // Update customer
                     await tx.customers.update({
                         where: { Id: customer.Id },
                         data: {
                             TotalSpent: { increment: finalTotal },
                             LoyaltyPoints: { increment: points },
-                            // Update CreditBalance for credit sales
-                            ...(creditBalanceUpdate > 0 && {
-                                CreditBalance: { increment: creditBalanceUpdate }
-                            }),
+                            CreditBalance: Number(unpaid._sum.BalanceAmount || 0),
                             LastPurchaseDate: new Date(),
                         },
                     });
@@ -495,10 +492,21 @@ export class SalesService {
 
             // Update customer credit balance
             if (sale.CustomerId) {
+
+
+                const unpaid = await tx.sales.aggregate({
+                    where: {
+                        CustomerId: sale.CustomerId,
+                        BalanceAmount: { gt: 0 },
+                        Status: { not: 4 },
+                    },
+                    _sum: { BalanceAmount: true },
+                });
+
                 await tx.customers.update({
                     where: { Id: sale.CustomerId },
                     data: {
-                        CreditBalance: { decrement: amount },
+                        CreditBalance: Number(unpaid._sum.BalanceAmount || 0),
                         LastPaymentDate: new Date(),
                     },
                 });
@@ -722,9 +730,16 @@ export class SalesService {
                     status = SaleStatus.PARTIALLY_RETURNED;
                 }
 
-                // Paid / balance after refund
-                const totalPaid = Number(sale.PaidAmount);
-                const newPaid = Math.max(0, totalPaid - totalRefund);
+                // ============================================================
+                // ✅ Correct paid / balance / cash-refund logic
+                // The customer's payment is not touched by a return.
+                // The return reduces the invoice total. Only if the customer
+                // overpaid after the return do we give cash back.
+                // ============================================================
+                const paid = Number(sale.PaidAmount);
+
+                const cashRefund = Math.max(0, paid - newTotalAmount);
+                const newPaid = Math.min(paid, newTotalAmount);
                 const newBalance = Math.max(0, newTotalAmount - newPaid);
 
                 await tx.sales.update({
@@ -761,41 +776,33 @@ export class SalesService {
                         },
                     });
 
-                    if (sale.Customers) {
-                        // ✅ Recalculate from unpaid sales (self-healing)
-                        const unpaid = await tx.sales.aggregate({
-                            where: {
-                                CustomerId: sale.CustomerId,
-                                BalanceAmount: { gt: 0 },
-                                Status: { not: 4 },
-                            },
-                            _sum: { BalanceAmount: true },
-                        });
+                    // ✅ Recalculate — no dependency on sale.Customers being loaded
+                    const unpaid = await tx.sales.aggregate({
+                        where: {
+                            CustomerId: sale.CustomerId,
+                            BalanceAmount: { gt: 0 },
+                            Status: { not: 4 },
+                        },
+                        _sum: { BalanceAmount: true },
+                    });
 
-                        await tx.customers.update({
-                            where: { Id: sale.CustomerId },
-                            data: {
-                                CreditBalance: Number(
-                                    unpaid._sum.BalanceAmount || 0
-                                ),
-                                TotalSpent: { decrement: totalRefund },
-                            },
-                        });
-                    }
+                    await tx.customers.update({
+                        where: { Id: sale.CustomerId },
+                        data: {
+                            CreditBalance: Number(unpaid._sum.BalanceAmount || 0),
+                            TotalSpent: { decrement: totalRefund },
+                        },
+                    });
                 }
 
                 // Cash refund
-                const cashRefund = Math.min(
-                    totalRefund,
-                    Number(sale.PaidAmount)
-                );
                 if (cashRefund > 0) {
                     await this.cashLedger.add(
                         'OUT',
                         cashRefund,
                         'RETURN',
                         dto.invoiceNumber,
-                        `Refund for ${dto.invoiceNumber}`
+                        `Cash refund for ${dto.invoiceNumber}`
                     );
                 }
 
@@ -853,93 +860,91 @@ export class SalesService {
     // SIMPLE RETURN (Full Invoice Return)
     // ============================
     async returnInvoice(invoiceNumber: string) {
-    return await this.prisma.$transaction(async (tx) => {
-        const sale = await tx.sales.findFirst({
-            where: { InvoiceNumber: invoiceNumber },
-            include: {
-                SaleItems: true,
-                Customers: true,
-            },
-        });
-
-        if (!sale) {
-            throw new NotFoundException('Invoice not found');
-        }
-
-        if (sale.Status === SaleStatus.FULLY_RETURNED) {
-            throw new BadRequestException('Already fully returned');
-        }
-
-        const totalAmount = Number(sale.TotalAmount);
-
-        // Restore stock
-        for (const item of sale.SaleItems) {
-            await tx.products.update({
-                where: { Id: item.ProductId },
-                data: {
-                    StockQty: { increment: item.Quantity },
+        return await this.prisma.$transaction(async (tx) => {
+            const sale = await tx.sales.findFirst({
+                where: { InvoiceNumber: invoiceNumber },
+                include: {
+                    SaleItems: true,
+                    Customers: true,
                 },
             });
-        }
 
-        // Create return record
-        const saleReturn = await tx.saleReturns.create({
-            data: {
-                Id: randomUUID(),
-                SaleId: sale.Id,
-                Reason: 'Full return',
-                ReturnedAt: new Date(),
-                ReturnAmount: totalAmount,
-            },
-        });
+            if (!sale) {
+                throw new NotFoundException('Invoice not found');
+            }
 
-        // Create return items
-        for (const item of sale.SaleItems) {
-            await tx.saleReturnItems.create({
+            if (sale.Status === SaleStatus.FULLY_RETURNED) {
+                throw new BadRequestException('Already fully returned');
+            }
+
+            const totalAmount = Number(sale.TotalAmount);
+
+            // Restore stock
+            for (const item of sale.SaleItems) {
+                await tx.products.update({
+                    where: { Id: item.ProductId },
+                    data: {
+                        StockQty: { increment: item.Quantity },
+                    },
+                });
+            }
+
+            // Create return record
+            const saleReturn = await tx.saleReturns.create({
                 data: {
                     Id: randomUUID(),
-                    SaleReturnId: saleReturn.Id,
-                    ProductId: item.ProductId,
-                    Quantity: item.Quantity,
-                    UnitPrice: item.UnitPrice,
-                    Reason: 'Full return',
-                },
-            });
-        }
-
-        // Update sale — zeroed out
-        await tx.sales.update({
-            where: { Id: sale.Id },
-            data: {
-                Status: SaleStatus.FULLY_RETURNED,
-                PaidAmount: 0,
-                BalanceAmount: 0,
-                IsCreditSale: false,
-                HasReturns: true,
-                ReturnedAmount: totalAmount,
-                SubTotal: 0,
-                InvoiceDiscount: 0,
-                TotalAmount: 0,
-            },
-        });
-
-        // Customer ledger + credit balance
-        if (sale.CustomerId) {
-            await tx.customerLedgerEntries.create({
-                data: {
-                    Id: randomUUID(),
-                    CustomerId: sale.CustomerId,
                     SaleId: sale.Id,
-                    SaleReturnId: saleReturn.Id,
-                    Debit: totalAmount,
-                    Credit: 0,
-                    Type: 'RETURN',
-                    CreatedAt: new Date(),
+                    Reason: 'Full return',
+                    ReturnedAt: new Date(),
+                    ReturnAmount: totalAmount,
                 },
             });
 
-            if (sale.Customers) {
-                // ✅ Recalculate from unpaid sales (self-healing)
+            // Create return items
+            for (const item of sale.SaleItems) {
+                await tx.saleReturnItems.create({
+                    data: {
+                        Id: randomUUID(),
+                        SaleReturnId: saleReturn.Id,
+                        ProductId: item.ProductId,
+                        Quantity: item.Quantity,
+                        UnitPrice: item.UnitPrice,
+                        Reason: 'Full return',
+                    },
+                });
+            }
+
+            // Update sale — zeroed out
+            await tx.sales.update({
+                where: { Id: sale.Id },
+                data: {
+                    Status: SaleStatus.FULLY_RETURNED,
+                    PaidAmount: 0,
+                    BalanceAmount: 0,
+                    IsCreditSale: false,
+                    HasReturns: true,
+                    ReturnedAmount: totalAmount,
+                    SubTotal: 0,
+                    InvoiceDiscount: 0,
+                    TotalAmount: 0,
+                },
+            });
+
+            if (sale.CustomerId) {
+                await tx.customerLedgerEntries.create({
+                    data: {
+                        Id: randomUUID(),
+                        CustomerId: sale.CustomerId,
+                        SaleId: sale.Id,
+                        SaleReturnId: saleReturn.Id,
+                        Debit: totalAmount,
+                        Credit: 0,
+                        Type: 'RETURN',
+                        CreatedAt: new Date(),
+                    },
+                });
+
+                // ✅ Recalculate CreditBalance from unpaid sales — no dependency on sale.Customers
                 const unpaid = await tx.sales.aggregate({
                     where: {
                         CustomerId: sale.CustomerId,
@@ -952,53 +957,50 @@ export class SalesService {
                 await tx.customers.update({
                     where: { Id: sale.CustomerId },
                     data: {
-                        CreditBalance: Number(
-                            unpaid._sum.BalanceAmount || 0
-                        ),
+                        CreditBalance: Number(unpaid._sum.BalanceAmount || 0),
                         TotalSpent: { decrement: totalAmount },
                     },
                 });
             }
-        }
 
-        // Cash refund — refund what the customer actually paid
-        const refundAmount = Number(sale.PaidAmount);
-        if (refundAmount > 0) {
-            await this.cashLedger.add(
-                'OUT',
-                refundAmount,
-                'RETURN',
+            // Cash refund — refund what the customer actually paid
+            const refundAmount = Number(sale.PaidAmount);
+            if (refundAmount > 0) {
+                await this.cashLedger.add(
+                    'OUT',
+                    refundAmount,
+                    'RETURN',
+                    invoiceNumber,
+                    `Full refund for ${invoiceNumber}`
+                );
+            }
+
+            const updatedCustomer = sale.CustomerId
+                ? await tx.customers.findUnique({
+                    where: { Id: sale.CustomerId },
+                    select: {
+                        Id: true,
+                        Name: true,
+                        Phone: true,
+                        CreditBalance: true,
+                        CreditLimit: true,
+                        LoyaltyPoints: true,
+                        LoyaltyTier: true,
+                        TotalSpent: true,
+                    },
+                })
+                : null;
+
+            return {
+                message: 'Return processed',
                 invoiceNumber,
-                `Full refund for ${invoiceNumber}`
-            );
-        }
-
-        const updatedCustomer = sale.CustomerId
-            ? await tx.customers.findUnique({
-                  where: { Id: sale.CustomerId },
-                  select: {
-                      Id: true,
-                      Name: true,
-                      Phone: true,
-                      CreditBalance: true,
-                      CreditLimit: true,
-                      LoyaltyPoints: true,
-                      LoyaltyTier: true,
-                      TotalSpent: true,
-                  },
-              })
-            : null;
-
-        return {
-            message: 'Return processed',
-            invoiceNumber,
-            CustomerCreditBalance: updatedCustomer?.CreditBalance
-                ? Number(updatedCustomer.CreditBalance)
-                : 0,
-            Customer: updatedCustomer,
-        };
-    });
-}
+                CustomerCreditBalance: updatedCustomer?.CreditBalance
+                    ? Number(updatedCustomer.CreditBalance)
+                    : 0,
+                Customer: updatedCustomer,
+            };
+        });
+    }
     // ============================
     // REPLACEMENT
     // ============================
@@ -1081,182 +1083,194 @@ export class SalesService {
 
 
     async cancelSale(saleId: string, reason?: string) {
-        return await this.prisma.$transaction(async (tx) => {
-            // 1. Find the sale
-            const sale = await tx.sales.findUnique({
-                where: { Id: saleId },
-                include: {
-                    SaleItems: {
-                        include: {
-                            Products: true,
+        return await this.prisma.$transaction(
+            async (tx) => {
+                // 1. Find the sale
+                const sale = await tx.sales.findUnique({
+                    where: { Id: saleId },
+                    include: {
+                        SaleItems: {
+                            include: {
+                                Products: true,
+                            },
                         },
-                    },
-                    Customers: true,
-                    SalePayments: true,
-                    CreditPayments: true,
-                },
-            });
-
-            if (!sale) {
-                throw new NotFoundException('Sale not found');
-            }
-
-            // 2. Check if already cancelled
-            if (sale.Status === 4) { // 4 = CANCELLED
-                throw new BadRequestException('Sale is already cancelled');
-            }
-
-            // 3. Check if already returned
-            if (sale.Status === 2) { // 2 = FULLY_RETURNED
-                throw new BadRequestException('Cannot cancel a returned sale');
-            }
-
-            // 4. Restore stock quantities
-            for (const item of sale.SaleItems) {
-                await tx.products.update({
-                    where: { Id: item.ProductId },
-                    data: {
-                        StockQty: { increment: item.Quantity },
+                        Customers: true,
+                        SalePayments: true,
+                        CreditPayments: true,
                     },
                 });
-            }
 
-            // 5. Reverse customer credit balance (if credit sale)
-            if (sale.CustomerId && sale.IsCreditSale) {
-                const currentBalance = Number(sale.Customers?.CreditBalance || 0);
-                const balanceAmount = Number(sale.BalanceAmount || 0);
+                if (!sale) {
+                    throw new NotFoundException('Sale not found');
+                }
 
-                // Only reverse if there's a balance
-                if (balanceAmount > 0) {
-                    await tx.customers.update({
-                        where: { Id: sale.CustomerId },
+                // 2. Check if already cancelled
+                if (sale.Status === 4) {
+                    throw new BadRequestException('Sale is already cancelled');
+                }
+
+                // 3. Check if already returned
+                if (sale.Status === 2) {
+                    throw new BadRequestException('Cannot cancel a returned sale');
+                }
+
+                // 4. Restore stock quantities
+                for (const item of sale.SaleItems) {
+                    await tx.products.update({
+                        where: { Id: item.ProductId },
                         data: {
-                            CreditBalance: { decrement: balanceAmount },
-                            TotalSpent: { decrement: Number(sale.TotalAmount || 0) },
-                            LoyaltyPoints: { decrement: Math.floor(Number(sale.TotalAmount || 0) / 2000) },
-                        },
-                    });
-                } else {
-                    // If fully paid, just reverse total spent and loyalty
-                    await tx.customers.update({
-                        where: { Id: sale.CustomerId },
-                        data: {
-                            TotalSpent: { decrement: Number(sale.TotalAmount || 0) },
-                            LoyaltyPoints: { decrement: Math.floor(Number(sale.TotalAmount || 0) / 2000) },
+                            StockQty: { increment: item.Quantity },
                         },
                     });
                 }
-            }
 
-            // 6. Reverse customer ledger entries
-            if (sale.CustomerId) {
-                // Create reverse ledger entry
-                await tx.customerLedgerEntries.create({
-                    data: {
-                        Id: randomUUID(),
-                        CustomerId: sale.CustomerId,
-                        SaleId: sale.Id,
-                        Debit: 0,
-                        Credit: Number(sale.TotalAmount || 0),
-                        Type: 'CANCELLATION',
-                        CreatedAt: new Date(),
-                    },
-                });
+                // 5. Reverse TotalSpent + Loyalty (leave CreditBalance alone — recalculated at the end)
+                if (sale.CustomerId) {
+                    const totalAmountValue = Number(sale.TotalAmount || 0);
+                    const loyaltyPoints = Math.floor(totalAmountValue / 2000);
 
-                // Also reverse any existing ledger entries for this sale
-                const existingLedgerEntries = await tx.customerLedgerEntries.findMany({
-                    where: { SaleId: sale.Id },
-                });
+                    await tx.customers.update({
+                        where: { Id: sale.CustomerId },
+                        data: {
+                            TotalSpent: { decrement: totalAmountValue },
+                            LoyaltyPoints: { decrement: loyaltyPoints },
+                        },
+                    });
+                }
 
-                for (const entry of existingLedgerEntries) {
+                // 6. Reverse customer ledger entries
+                if (sale.CustomerId) {
+                    // Create top-level cancellation entry
                     await tx.customerLedgerEntries.create({
                         data: {
                             Id: randomUUID(),
                             CustomerId: sale.CustomerId,
                             SaleId: sale.Id,
-                            Debit: entry.Credit || 0,
-                            Credit: entry.Debit || 0,
-                            Type: 'CANCELLATION_REVERSAL',
+                            Debit: 0,
+                            Credit: Number(sale.TotalAmount || 0),
+                            Type: 'CANCELLATION',
                             CreatedAt: new Date(),
                         },
                     });
-                }
-            }
 
-            // 7. Reverse cash ledger (if cash or card payment)
-            const paidAmount = Number(sale.PaidAmount || 0);
-            if (paidAmount > 0 && (sale.paymentMode === 'cash' || sale.paymentMode === 'card')) {
-                await this.cashLedger.add(
-                    'OUT',
-                    paidAmount,
-                    'CANCELLATION',
-                    sale.InvoiceNumber,
-                    `Cancellation refund for ${sale.InvoiceNumber}${reason ? ` (${reason})` : ''}`
-                );
-            }
+                    // Reverse any existing ledger entries for this sale
+                    const existingLedgerEntries =
+                        await tx.customerLedgerEntries.findMany({
+                            where: { SaleId: sale.Id },
+                        });
 
-            // 8. Reverse credit payments (if any)
-            if (sale.CreditPayments && sale.CreditPayments.length > 0) {
-                for (const payment of sale.CreditPayments) {
-                    // Create reverse entry in credit payments
-                    await tx.creditPayments.create({
-                        data: {
-                            Id: randomUUID(),
-                            SaleId: sale.Id,
-                            Amount: -Number(payment.Amount || 0),
-                            PaidAt: new Date(),
-                            Note: `Cancellation reversal${reason ? `: ${reason}` : ''}`,
-                        },
-                    });
-
-                    // Reverse customer credit balance for the payment
-                    if (sale.CustomerId) {
-                        await tx.customers.update({
-                            where: { Id: sale.CustomerId },
+                    for (const entry of existingLedgerEntries) {
+                        await tx.customerLedgerEntries.create({
                             data: {
-                                CreditBalance: { increment: Number(payment.Amount || 0) },
+                                Id: randomUUID(),
+                                CustomerId: sale.CustomerId,
+                                SaleId: sale.Id,
+                                Debit: entry.Credit || 0,
+                                Credit: entry.Debit || 0,
+                                Type: 'CANCELLATION_REVERSAL',
+                                CreatedAt: new Date(),
                             },
                         });
                     }
                 }
-            }
 
-            // 9. Reverse sale payments
-            if (sale.SalePayments && sale.SalePayments.length > 0) {
-                for (const payment of sale.SalePayments) {
-                    await tx.salePayments.create({
+                // 7. Reverse cash ledger (if cash or card payment)
+                const paidAmount = Number(sale.PaidAmount || 0);
+                if (
+                    paidAmount > 0 &&
+                    (sale.paymentMode === 'cash' || sale.paymentMode === 'card')
+                ) {
+                    await this.cashLedger.add(
+                        'OUT',
+                        paidAmount,
+                        'CANCELLATION',
+                        sale.InvoiceNumber,
+                        `Cancellation refund for ${sale.InvoiceNumber}${reason ? ` (${reason})` : ''
+                        }`
+                    );
+                }
+
+                // 8. Reverse credit payments (if any) — no CreditBalance change here
+                if (sale.CreditPayments && sale.CreditPayments.length > 0) {
+                    for (const payment of sale.CreditPayments) {
+                        await tx.creditPayments.create({
+                            data: {
+                                Id: randomUUID(),
+                                SaleId: sale.Id,
+                                Amount: -Number(payment.Amount || 0),
+                                PaidAt: new Date(),
+                                Note: `Cancellation reversal${reason ? `: ${reason}` : ''
+                                    }`,
+                            },
+                        });
+                    }
+                }
+
+                // 9. Reverse sale payments
+                if (sale.SalePayments && sale.SalePayments.length > 0) {
+                    for (const payment of sale.SalePayments) {
+                        await tx.salePayments.create({
+                            data: {
+                                Id: randomUUID(),
+                                SaleId: sale.Id,
+                                PaymentMode: payment.PaymentMode,
+                                Amount: -Number(payment.Amount || 0),
+                                PaidAt: new Date(),
+                                Status: 'cancelled',
+                                Reference: `Cancellation of ${payment.Reference || payment.Id
+                                    }`,
+                            },
+                        });
+                    }
+                }
+
+                // 10. Update sale status to CANCELLED
+                const updatedSale = await tx.sales.update({
+                    where: { Id: sale.Id },
+                    data: {
+                        Status: 4,
+                        BalanceAmount: 0,
+                        PaidAmount: 0,
+                        IsCreditSale: false,
+                    },
+                });
+
+                // ============================================================
+                // 11. ✅ FIX B: Recalculate CreditBalance from remaining
+                // unpaid sales — never increment/decrement, always reset to truth.
+                // Runs AFTER the sale is marked cancelled so it's excluded from the sum.
+                // ============================================================
+                if (sale.CustomerId) {
+                    const unpaid = await tx.sales.aggregate({
+                        where: {
+                            CustomerId: sale.CustomerId,
+                            BalanceAmount: { gt: 0 },
+                            Status: { not: 4 },
+                        },
+                        _sum: { BalanceAmount: true },
+                    });
+
+
+
+                    await tx.customers.update({
+                        where: { Id: sale.CustomerId },
                         data: {
-                            Id: randomUUID(),
-                            SaleId: sale.Id,
-                            PaymentMode: payment.PaymentMode,
-                            Amount: -Number(payment.Amount || 0),
-                            PaidAt: new Date(),
-                            Status: 'cancelled',
-                            Reference: `Cancellation of ${payment.Reference || payment.Id}`,
+                            CreditBalance: Number(unpaid._sum.BalanceAmount || 0),
                         },
                     });
                 }
+
+                return {
+                    message: `Sale ${sale.InvoiceNumber} cancelled successfully${reason ? ` (${reason})` : ''
+                        }`,
+                    sale: updatedSale,
+                };
+            },
+            {
+                timeout: 30000,
+                maxWait: 15000,
             }
-
-            // 10. Update sale status to CANCELLED
-            const updatedSale = await tx.sales.update({
-                where: { Id: sale.Id },
-                data: {
-                    Status: 4, // 4 = CANCELLED
-                    BalanceAmount: 0,
-                    PaidAmount: 0,
-                    IsCreditSale: false,
-                },
-            });
-
-            return {
-                message: `Sale ${sale.InvoiceNumber} cancelled successfully${reason ? ` (${reason})` : ''}`,
-                sale: updatedSale,
-            };
-        }, {
-            timeout: 30000,
-            maxWait: 15000,
-        });
+        );
     }
 
     // ============================
@@ -2432,6 +2446,7 @@ export class SalesService {
                     );
                 }
 
+
                 const alreadyCleared = rows.filter((r) => r.Status === 'cleared');
                 if (alreadyCleared.length === rows.length) {
                     throw new BadRequestException('Cheque already cleared');
@@ -2449,6 +2464,20 @@ export class SalesService {
 
                 for (const row of rows) {
                     if (row.Status !== 'pending') continue;
+
+                    if (row.Sales.CustomerId) {
+                        await tx.customerLedgerEntries.create({
+                            data: {
+                                Id: randomUUID(),
+                                CustomerId: row.Sales.CustomerId,
+                                SaleId: row.SaleId,
+                                Debit: 0,
+                                Credit: 0,
+                                Type: 'CHEQUE_CLEARED',
+                                CreatedAt: new Date(),
+                            },
+                        });
+                    }
 
                     const amount = Number(row.Amount);
                     totalCleared += amount;
@@ -2596,73 +2625,73 @@ export class SalesService {
 
 
     async getAllReturns(filters?: {
-    startDate?: Date;
-    endDate?: Date;
-    customerId?: string;
-    productId?: string;
-}) {
-    const where: any = {};
+        startDate?: Date;
+        endDate?: Date;
+        customerId?: string;
+        productId?: string;
+    }) {
+        const where: any = {};
 
-    if (filters?.startDate || filters?.endDate) {
-        where.ReturnedAt = {};
-        if (filters.startDate) where.ReturnedAt.gte = filters.startDate;
-        if (filters.endDate) {
-            const end = new Date(filters.endDate);
-            end.setUTCDate(end.getUTCDate() + 1);
-            where.ReturnedAt.lt = end;
+        if (filters?.startDate || filters?.endDate) {
+            where.ReturnedAt = {};
+            if (filters.startDate) where.ReturnedAt.gte = filters.startDate;
+            if (filters.endDate) {
+                const end = new Date(filters.endDate);
+                end.setUTCDate(end.getUTCDate() + 1);
+                where.ReturnedAt.lt = end;
+            }
         }
-    }
 
-    if (filters?.customerId) {
-        where.Sales = { CustomerId: filters.customerId };
-    }
+        if (filters?.customerId) {
+            where.Sales = { CustomerId: filters.customerId };
+        }
 
-    const returns = await this.prisma.saleReturns.findMany({
-        where,
-        include: {
-            Sales: {
-                include: {
-                    Customers: true,
+        const returns = await this.prisma.saleReturns.findMany({
+            where,
+            include: {
+                Sales: {
+                    include: {
+                        Customers: true,
+                    },
+                },
+                SaleReturnItems: {
+                    include: {
+                        Products: true,
+                    },
                 },
             },
-            SaleReturnItems: {
-                include: {
-                    Products: true,
-                },
+            orderBy: {
+                ReturnedAt: 'desc',
             },
-        },
-        orderBy: {
-            ReturnedAt: 'desc',
-        },
-    });
+        });
 
-    return returns.map((r) => ({
-        Id: r.Id,
-        ReturnedAt: r.ReturnedAt,
-        Reason: r.Reason,
-        ReturnAmount: Number(r.ReturnAmount),
-        RefundAmount: Number(r.RefundAmount || 0),
-        RefundMethod: r.RefundMethod,
+        return returns.map((r) => ({
+            Id: r.Id,
+            ReturnedAt: r.ReturnedAt,
+            Reason: r.Reason,
+            ReturnAmount: Number(r.ReturnAmount),
+            RefundAmount: Number(r.RefundAmount || 0),
+            RefundMethod: r.RefundMethod,
 
-        SaleId: r.SaleId,
-        InvoiceNumber: r.Sales?.InvoiceNumber || null,
-        SaleDate: r.Sales?.CreatedAt || null,
+            SaleId: r.SaleId,
+            InvoiceNumber: r.Sales?.InvoiceNumber || null,
+            SaleDate: r.Sales?.CreatedAt || null,
 
-        CustomerId: r.Sales?.CustomerId || null,
-        CustomerName: r.Sales?.Customers?.Name || 'Walk-in Customer',
-        CustomerPhone: r.Sales?.Customers?.Phone || null,
+            CustomerId: r.Sales?.CustomerId || null,
+            CustomerName: r.Sales?.Customers?.Name || 'Walk-in Customer',
+            CustomerPhone: r.Sales?.Customers?.Phone || null,
 
-        Items: r.SaleReturnItems.map((ri) => ({
-            ProductId: ri.ProductId,
-            ProductName: ri.Products?.Name || 'Unknown',
-            ProductBarcode: ri.Products?.Barcode || null,
-            Quantity: ri.Quantity,
-            UnitPrice: Number(ri.UnitPrice),
-            Reason: ri.Reason,
-            LineTotal: Number(ri.UnitPrice) * ri.Quantity,
-        })),
-    }));
-}
+            Items: r.SaleReturnItems.map((ri) => ({
+                ProductId: ri.ProductId,
+                ProductName: ri.Products?.Name || 'Unknown',
+                ProductBarcode: ri.Products?.Barcode || null,
+                Quantity: ri.Quantity,
+                UnitPrice: Number(ri.UnitPrice),
+                Reason: ri.Reason,
+                LineTotal: Number(ri.UnitPrice) * ri.Quantity,
+            })),
+        }));
+    }
 
 
 }
