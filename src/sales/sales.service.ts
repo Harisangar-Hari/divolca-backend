@@ -320,6 +320,25 @@ export class SalesService {
                     },
                 }) : null;
 
+
+
+                // ✅ If a quotation was attached, mark it converted
+                if (dto.quotationId) {
+                    const quote = await tx.quotations.findUnique({
+                        where: { Id: dto.quotationId },
+                    });
+                    if (quote && quote.Status === 'draft') {
+                        await tx.quotations.update({
+                            where: { Id: dto.quotationId },
+                            data: {
+                                Status: 'converted',
+                                ConvertedSaleId: sale.Id,
+                                ConvertedAt: new Date(),
+                            },
+                        });
+                    }
+                }
+
                 // ============================
                 // 11. RETURN RESPONSE
                 // ============================
@@ -1140,18 +1159,6 @@ export class SalesService {
 
                 // 6. Reverse customer ledger entries
                 if (sale.CustomerId) {
-                    // Create top-level cancellation entry
-                    await tx.customerLedgerEntries.create({
-                        data: {
-                            Id: randomUUID(),
-                            CustomerId: sale.CustomerId,
-                            SaleId: sale.Id,
-                            Debit: 0,
-                            Credit: Number(sale.TotalAmount || 0),
-                            Type: 'CANCELLATION',
-                            CreatedAt: new Date(),
-                        },
-                    });
 
                     // Reverse any existing ledger entries for this sale
                     const existingLedgerEntries =

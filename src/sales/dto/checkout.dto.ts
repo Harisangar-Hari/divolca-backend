@@ -52,6 +52,10 @@ export class CreateCheckoutDto {
     @IsString()
     @IsOptional()
     paymentReference?: string;
+
+    @IsString()
+    @IsOptional()
+    quotationId?: string;
 }
 
 export class EditSaleItemDto {

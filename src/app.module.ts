@@ -21,6 +21,7 @@ import { SalesModule } from './sales/sales.module';
 import { SuppliersModule } from './suppliers/suppliers.module';
 import { BrandsModule } from './brands/brands.module';
 import { ReportsModule } from './reports/reports.module';
+import { QuotationsModule } from './quotations/quotations.module';
 
 
 @Module({
@@ -62,6 +63,8 @@ import { ReportsModule } from './reports/reports.module';
     BrandsModule,
 
     ReportsModule,
+
+    QuotationsModule,
   ],
 
   controllers: [

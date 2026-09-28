@@ -128,6 +128,7 @@ model Customers {
   // Relations
   CustomerLedgerEntries CustomerLedgerEntries[]
   Sales                 Sales[]
+  Quotations            Quotations[]
 }
 
 // Add enum for customer type
@@ -179,6 +180,7 @@ model Products {
   PurchaseItems   PurchaseItems[]
   SaleItems       SaleItems[]
   SaleReturnItems SaleReturnItems[]
+  QuotationItems        QuotationItems[]
 
   @@index([CategoryId], map: "IX_Products_CategoryId")
   @@index([BrandId], map: "IX_Products_BrandId")
@@ -323,6 +325,52 @@ model Users {
   FullName     String?
   Email        String?  @unique
   Permissions  Json?  
+}
+
+model Quotations {
+  Id              String    @id(map: "PK_Quotations") @db.Uuid
+  Sequence        Int       @unique @default(autoincrement())
+  QuotationNumber String    @unique
+  CreatedAt       DateTime  @default(now()) @db.Timestamptz(6)
+  UpdatedAt       DateTime? @updatedAt @db.Timestamptz(6)
+
+  // Optional customer
+  CustomerId    String? @db.Uuid
+  CustomerName  String?
+  CustomerPhone String?
+  Notes         String?
+
+  // Totals
+  SubTotal        Decimal @default(0.0) @db.Decimal
+  InvoiceDiscount Decimal @default(0.0) @db.Decimal
+  TotalAmount     Decimal @default(0.0) @db.Decimal
+
+  // Status: 'draft' | 'converted' | 'cancelled'
+  Status          String    @default("draft")
+  ConvertedSaleId String?   @db.Uuid
+  ConvertedAt     DateTime? @db.Timestamptz(6)
+
+  Customers      Customers?       @relation(fields: [CustomerId], references: [Id], onDelete: SetNull, onUpdate: NoAction, map: "FK_Quotations_Customers_CustomerId")
+  QuotationItems QuotationItems[]
+
+  @@index([CustomerId], map: "IX_Quotations_CustomerId")
+  @@index([Status], map: "IX_Quotations_Status")
+}
+
+model QuotationItems {
+  Id          String  @id(map: "PK_QuotationItems") @db.Uuid
+  QuotationId String  @db.Uuid
+  ProductId   String  @db.Uuid
+  Quantity    Int
+  UnitPrice   Decimal @db.Decimal
+  Discount    Decimal @default(0.0) @db.Decimal
+  Total       Decimal @db.Decimal
+
+  Products   Products   @relation(fields: [ProductId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_QuotationItems_Products_ProductId")
+  Quotations Quotations @relation(fields: [QuotationId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_QuotationItems_Quotations_QuotationId")
+
+  @@index([QuotationId], map: "IX_QuotationItems_QuotationId")
+  @@index([ProductId], map: "IX_QuotationItems_ProductId")
 }
 
 model EFMigrationsHistory {
