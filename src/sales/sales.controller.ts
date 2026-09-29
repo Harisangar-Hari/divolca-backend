@@ -24,6 +24,7 @@ import {
     UpdateSaleItemDto,
 } from './dto/checkout.dto';
 import { Permissions } from '../auth/decorators/permissions.decorator';
+import { DeliveryCollectionDto } from './dto/delivery-collection.dto';
 
 @Controller('sales')
 export class SalesController {
@@ -248,6 +249,20 @@ export class SalesController {
         @Param('itemId') itemId: string,
     ) {
         return this.salesService.removeSaleItem(saleId, itemId);
+    }
+
+
+    // =========================
+    // ✅ DELIVERY COLLECTION
+    // =========================
+    @Post(':id/delivery-collection')
+    @Permissions('canManageCreditPayments')
+    @HttpCode(HttpStatus.OK)
+    async recordDeliveryCollection(
+        @Param('id') id: string,
+        @Body() dto: DeliveryCollectionDto
+    ) {
+        return this.salesService.recordDeliveryCollection(id, dto);
     }
 
 

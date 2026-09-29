@@ -6,6 +6,7 @@ import { AddSaleItemDto, CreateCheckoutDto, EditSaleDto, UpdateSaleItemDto } fro
 import { randomUUID } from 'crypto';
 import { CreateSaleReturnDto } from './dto/return-sale.dto';
 import { RecordBulkCreditChequeDto, RecordCreditChequeDto } from './dto/record-credit-cheque.dto';
+import { DeliveryCollectionDto } from './dto/delivery-collection.dto';
 
 export enum PaymentMode {
     CASH = 'cash',
@@ -2699,6 +2700,172 @@ export class SalesService {
             })),
         }));
     }
+
+    // ============================================================
+// ✅ RECORD DELIVERY COLLECTION
+// Applies a % discount to the CURRENT total, folds it into InvoiceDiscount,
+// stores the amount in DeliveryDiscount for reporting, and records the cash.
+// ============================================================
+async recordDeliveryCollection(
+    saleId: string,
+    dto: DeliveryCollectionDto
+) {
+    return await this.prisma.$transaction(
+        async (tx) => {
+            const sale = await tx.sales.findUnique({
+                where: { Id: saleId },
+                include: { Customers: true },
+            });
+
+            if (!sale) {
+                throw new NotFoundException('Sale not found');
+            }
+
+            if (sale.Status === 4) {
+                throw new BadRequestException(
+                    'Cannot collect payment for a cancelled sale'
+                );
+            }
+
+            if (sale.Status === 2) {
+                throw new BadRequestException(
+                    'Cannot collect payment for a fully returned sale'
+                );
+            }
+
+            const currentTotal = Number(sale.TotalAmount || 0);
+            const currentBalance = Number(sale.BalanceAmount || 0);
+
+            if (currentTotal <= 0) {
+                throw new BadRequestException(
+                    'Sale has no amount to collect'
+                );
+            }
+
+            if (currentBalance <= 0) {
+                throw new BadRequestException(
+                    'Sale is already fully paid'
+                );
+            }
+
+            // 1. Compute delivery discount on CURRENT net total
+            const deliveryDiscountAmount =
+                Math.round(currentTotal * (dto.deliveryDiscountPercent / 100) * 100) / 100;
+
+            const newTotal = Math.max(
+                0,
+                currentTotal - deliveryDiscountAmount
+            );
+
+            // 2. Fold into InvoiceDiscount (for internal consistency)
+            const oldInvoiceDiscount = Number(sale.InvoiceDiscount || 0);
+            const newInvoiceDiscount =
+                oldInvoiceDiscount + deliveryDiscountAmount;
+
+            // 3. Validate cash collected
+            if (dto.cashCollected > newTotal) {
+                throw new BadRequestException(
+                    `Cash collected (Rs ${dto.cashCollected}) exceeds the discounted total (Rs ${newTotal})`
+                );
+            }
+
+            // 4. Compute paid / balance
+            const oldPaid = Number(sale.PaidAmount || 0);
+            const newPaid = oldPaid + dto.cashCollected;
+            const newBalance = Math.max(0, newTotal - newPaid);
+
+            // 5. Update sale
+            await tx.sales.update({
+                where: { Id: saleId },
+                data: {
+                    TotalAmount: newTotal,
+                    InvoiceDiscount: newInvoiceDiscount,
+                    DeliveryDiscount: deliveryDiscountAmount,
+                    PaidAmount: newPaid,
+                    BalanceAmount: newBalance,
+                    IsCreditSale: newBalance > 0,
+                },
+            });
+
+            // 6. Record SalePayment
+            await tx.salePayments.create({
+                data: {
+                    Id: randomUUID(),
+                    SaleId: saleId,
+                    PaymentMode: 'cash',
+                    Amount: dto.cashCollected,
+                    PaidAt: new Date(),
+                    Status: 'completed',
+                    Reference: dto.collectedBy
+                        ? `Delivery — ${dto.collectedBy}`
+                        : 'Delivery collection',
+                },
+            });
+
+            // 7. Customer ledger + credit balance recalc
+            if (sale.CustomerId) {
+                await tx.customerLedgerEntries.create({
+                    data: {
+                        Id: randomUUID(),
+                        CustomerId: sale.CustomerId,
+                        SaleId: saleId,
+                        Debit: dto.cashCollected,
+                        Credit: 0,
+                        Type: 'PAYMENT',
+                        CreatedAt: new Date(),
+                    },
+                });
+
+                const unpaid = await tx.sales.aggregate({
+                    where: {
+                        CustomerId: sale.CustomerId,
+                        BalanceAmount: { gt: 0 },
+                        Status: { not: 4 },
+                    },
+                    _sum: { BalanceAmount: true },
+                });
+
+                await tx.customers.update({
+                    where: { Id: sale.CustomerId },
+                    data: {
+                        CreditBalance: Number(
+                            unpaid._sum.BalanceAmount || 0
+                        ),
+                        LastPaymentDate: new Date(),
+                    },
+                });
+            }
+
+            // 8. Cash ledger IN (only the real cash that arrived)
+            await this.cashLedger.add(
+                'IN',
+                dto.cashCollected,
+                'DELIVERY_COLLECTION',
+                sale.InvoiceNumber,
+                `Delivery cash for ${sale.InvoiceNumber}${
+                    dto.collectedBy ? ` (${dto.collectedBy})` : ''
+                }`
+            );
+
+            return {
+                message: 'Delivery collection recorded',
+                invoiceNumber: sale.InvoiceNumber,
+                deliveryDiscountPercent: dto.deliveryDiscountPercent,
+                deliveryDiscountAmount,
+                oldTotal: currentTotal,
+                newTotal,
+                cashCollected: dto.cashCollected,
+                newPaid,
+                newBalance,
+                collectedBy: dto.collectedBy || null,
+            };
+        },
+        {
+            timeout: 30000,
+            maxWait: 15000,
+        }
+    );
+}
 
 
 }

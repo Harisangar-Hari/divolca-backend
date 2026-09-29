@@ -276,6 +276,7 @@ model Sales {
   ReturnedAmount        Decimal                 @default(0.0) @db.Decimal
   InvoiceDiscount       Decimal                 @default(0.0) @db.Decimal
   SubTotal              Decimal                 @default(0.0) @db.Decimal
+  DeliveryDiscount  Decimal @default(0.0) @db.Decimal
   CreditPayments        CreditPayments[]
   CustomerLedgerEntries CustomerLedgerEntries[]
   SaleItems             SaleItems[]
