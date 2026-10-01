@@ -113,11 +113,13 @@ export class ReportsController {
         @Query('startDate') startDate?: string,
         @Query('endDate') endDate?: string,
         @Query('paymentMode') paymentMode?: string,
+        @Query('includeCancelled') includeCancelled?: string,   // ✅
     ) {
         return this.reportsService.getSalesReport({
             startDate: startDate ? new Date(startDate) : undefined,
             endDate: endDate ? new Date(endDate) : undefined,
             paymentMode,
+            includeCancelled: includeCancelled === 'true',
         });
     }
 

@@ -20,209 +20,178 @@ export class ChequeService {
 
 
     async processDueCheques() {
-
-
         const today = new Date();
 
-        const cheques =
-            await this.prisma.supplierPayments.findMany({
+        const cheques = await this.prisma.supplierPayments.findMany({
+            where: {
+                PaymentMethod: 'Cheque',
+                Status: 'Pending',
+                ChequeDate: { lte: today },
+            },
+            include: { Purchases: true },
+        });
 
-                where: {
-
-                    PaymentMethod: "Cheque",
-
-                    Status: "Pending",
-
-                    ChequeDate: {
-                        lte: today
-                    }
-
-                },
-
-                include: {
-
-                    Purchases: true
-
-                }
-
-            });
-
-
+        let processed = 0;
+        let totalCleared = 0;
+        let advanceCleared = 0;
 
         for (const cheque of cheques) {
-
+            const amount = Number(cheque.Amount);
+            const isAdvance = cheque.PurchaseId === null;
 
             await this.prisma.supplierPayments.update({
-
-                where: {
-                    Id: cheque.Id
-                },
-
+                where: { Id: cheque.Id },
                 data: {
-
-                    Status: "Cleared",
-
-                    ClearedAt: new Date()
-
-                }
-
+                    Status: 'Cleared',
+                    ClearedAt: new Date(),
+                },
             });
 
+            if (isAdvance) {
+                const supplierId =
+                    cheque.SupplierId || cheque.Purchases?.SupplierId;
 
+                if (supplierId) {
+                    await this.prisma.suppliers.update({
+                        where: { Id: supplierId },
+                        data: {
+                            PendingAdvance: { decrement: amount },
+                            AdvanceBalance: { increment: amount },
+                        },
+                    });
+                }
 
-            if (!cheque.CashLedgerPosted) {
+                if (!cheque.CashLedgerPosted) {
+                    await this.cashLedger.add(
+                        'OUT',
+                        amount,
+                        'SUPPLIER_CHEQUE_ADVANCE_CLEARED',
+                        cheque.ChequeNumber || 'N/A',
+                        `Advance of cheque #${cheque.ChequeNumber} cleared`
+                    );
 
+                    await this.prisma.supplierPayments.update({
+                        where: { Id: cheque.Id },
+                        data: { CashLedgerPosted: true },
+                    });
+                }
 
+                advanceCleared += amount;
+            } else if (!cheque.CashLedgerPosted) {
                 await this.cashLedger.add(
-
-                    "OUT",
-
-                    Number(cheque.Amount),
-
-                    "SUPPLIER_CHEQUE_CLEAR",
-
-                    cheque.Purchases.InvoiceNumber,
-
-                    `Cheque cleared for supplier ${cheque.Purchases.InvoiceNumber}`
-
+                    'OUT',
+                    amount,
+                    'SUPPLIER_CHEQUE_CLEAR',
+                    cheque.Purchases?.InvoiceNumber || 'N/A',
+                    `Cheque cleared for ${cheque.Purchases?.InvoiceNumber || 'N/A'
+                    }`
                 );
 
-
                 await this.prisma.supplierPayments.update({
-
-                    where: {
-                        Id: cheque.Id
-                    },
-
-                    data: {
-                        CashLedgerPosted: true
-                    }
-
+                    where: { Id: cheque.Id },
+                    data: { CashLedgerPosted: true },
                 });
-
             }
 
-
+            processed++;
+            totalCleared += amount;
         }
 
-
         return {
-            message: "Cheque processing completed"
+            message: `Processed ${processed} due cheque(s)`,
+            processed,
+            totalCleared,
+            advanceCleared,
         };
-
     }
 
     async clearCheque(id: string) {
-
-
-        const cheque =
-            await this.prisma.supplierPayments.findUnique({
-
-                where: {
-                    Id: id
-                },
-
-                include: {
-                    Purchases: true
-                }
-
-            });
-
-
+        const cheque = await this.prisma.supplierPayments.findUnique({
+            where: { Id: id },
+            include: { Purchases: true },
+        });
 
         if (!cheque) {
-
-            throw new NotFoundException(
-                "Cheque not found"
-            );
-
+            throw new NotFoundException('Cheque not found');
         }
 
+        if (cheque.PaymentMethod !== 'Cheque') {
+            throw new BadRequestException('This payment is not a cheque');
+        }
 
+        if (cheque.Status === 'Cleared') {
+            throw new BadRequestException('Cheque already cleared');
+        }
 
-        if (cheque.PaymentMethod !== "Cheque") {
-
+        // ✅ NEW — block bounced cheques
+        if (cheque.Status === 'Bounced') {
             throw new BadRequestException(
-                "This payment is not a cheque"
+                'Cheque was bounced — cannot clear'
             );
-
         }
 
+        const amount = Number(cheque.Amount);
+        const isAdvance = cheque.PurchaseId === null;
 
+        return await this.prisma.$transaction(async (tx) => {
+            // ✅ NEW — advance rows: move PendingAdvance → AdvanceBalance
+            if (isAdvance) {
+                const supplierId =
+                    cheque.SupplierId || cheque.Purchases?.SupplierId || null;
 
-        if (cheque.Status === "Cleared") {
-
-            throw new BadRequestException(
-                "Cheque already cleared"
-            );
-
-        }
-
-
-
-
-        // Create cash ledger OUT
-
-        if (!cheque.CashLedgerPosted) {
-
-
-            await this.cashLedger.add(
-
-                "OUT",
-
-                Number(cheque.Amount),
-
-                "SUPPLIER_CHEQUE_CLEAR",
-
-                cheque.Purchases.InvoiceNumber,
-
-                `Cheque cleared for supplier ${cheque.Purchases.InvoiceNumber}`
-
-            );
-
-
-        }
-
-
-
-
-
-        // Update cheque
-
-        const updated =
-            await this.prisma.supplierPayments.update({
-
-                where: {
-                    Id: id
-                },
-
-
-                data: {
-
-                    Status: "Cleared",
-
-                    ClearedAt: new Date(),
-
-                    CashLedgerPosted: true
-
+                if (supplierId) {
+                    await tx.suppliers.update({
+                        where: { Id: supplierId },
+                        data: {
+                            PendingAdvance: { decrement: amount },
+                            AdvanceBalance: { increment: amount },
+                        },
+                    });
                 }
 
+                if (!cheque.CashLedgerPosted) {
+                    await this.cashLedger.add(
+                        'OUT',
+                        amount,
+                        'SUPPLIER_CHEQUE_ADVANCE_CLEARED',
+                        cheque.ChequeNumber || 'N/A',
+                        `Advance portion of cheque #${cheque.ChequeNumber || 'N/A'
+                        } cleared`
+                    );
+                }
+            } else {
+                // Sale-backed rows: existing behavior
+                if (!cheque.CashLedgerPosted) {
+                    await this.cashLedger.add(
+                        'OUT',
+                        amount,
+                        'SUPPLIER_CHEQUE_CLEAR',
+                        cheque.Purchases?.InvoiceNumber || 'N/A',
+                        `Cheque cleared for supplier ${cheque.Purchases?.InvoiceNumber || 'N/A'
+                        }`
+                    );
+                }
+            }
 
+            // Mark cleared
+            const updated = await tx.supplierPayments.update({
+                where: { Id: id },
+                data: {
+                    Status: 'Cleared',
+                    ClearedAt: new Date(),
+                    CashLedgerPosted: true,
+                },
             });
 
-
-
-        return {
-
-            message: "Cheque cleared successfully",
-
-            paymentId: updated.Id,
-
-            status: updated.Status
-
-        };
-
-
+            return {
+                message: isAdvance
+                    ? `Advance cleared — Rs ${amount} now available`
+                    : 'Cheque cleared successfully',
+                paymentId: updated.Id,
+                status: updated.Status,
+                isAdvance,
+            };
+        });
     }
 
 

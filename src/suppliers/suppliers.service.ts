@@ -6,6 +6,7 @@ import { CashLedgerService } from '../cash-ledger/cash-ledger.service';
 import { CreateSupplierDto } from './dto/create-supplier.dto';
 import { UpdateSupplierDto } from './dto/update-supplier.dto';
 import { PaySupplierDto } from './dto/pay-supplier.dto';
+import { randomUUID } from 'crypto';
 
 
 @Injectable()
@@ -79,77 +80,42 @@ export class SuppliersService {
     // GET SUPPLIER BY ID
     // =========================
 
-    async findOne(id: string) {
-
-
-        const supplier = await this.prisma.suppliers.findUnique({
-
-            where: {
-                Id: id
+   async findOne(id: string) {
+    const supplier = await this.prisma.suppliers.findUnique({
+        where: { Id: id },
+        include: {
+            Purchases: {
+                include: { PurchaseItems: true },
+                orderBy: { PurchaseDate: 'desc' },
             },
+        },
+    });
 
-            include: {
+    if (!supplier) throw new NotFoundException('Supplier not found');
 
-                Purchases: {
+    return {
+        Id: supplier.Id,
+        Name: supplier.Name,
+        Phone: supplier.Phone,
+        Email: supplier.Email,
+        Address: supplier.Address,
+        CreatedAt: supplier.CreatedAt,
 
-                    include: {
-                        PurchaseItems: true
-                    },
+        // ✅ NEW
+        AdvanceBalance: supplier.AdvanceBalance || 0,
+        PendingAdvance: supplier.PendingAdvance || 0,
 
-                    orderBy: {
-                        PurchaseDate: 'desc'
-                    }
-
-                }
-
-            }
-
-        });
-
-
-
-        if (!supplier)
-            throw new NotFoundException("Supplier not found");
-
-
-
-        return {
-
-            Id: supplier.Id,
-
-            Name: supplier.Name,
-
-            Phone: supplier.Phone,
-
-            Email: supplier.Email,
-
-            Address: supplier.Address,
-
-            CreatedAt: supplier.CreatedAt,
-
-
-            purchases: supplier.Purchases.map(p => ({
-
-                Id: p.Id,
-
-                InvoiceNumber: p.InvoiceNumber,
-
-                GrandTotal: p.GrandTotal,
-
-                PurchaseDate: p.PurchaseDate,
-
-                itemsCount: p.PurchaseItems.length,
-
-                PaidAmount: p.PaidAmount,
-
-                BalanceAmount: p.BalanceAmount
-
-            }))
-
-        };
-
-    }
-
+        purchases: supplier.Purchases.map((p) => ({
+            Id: p.Id,
+            InvoiceNumber: p.InvoiceNumber,
+            GrandTotal: p.GrandTotal,
+            PurchaseDate: p.PurchaseDate,
+            itemsCount: p.PurchaseItems.length,
+            PaidAmount: p.PaidAmount,
+            BalanceAmount: p.BalanceAmount,
+        })),
+    };
+}
 
 
 
@@ -405,47 +371,67 @@ export class SuppliersService {
 
 
     // =========================
-    // PAY SUPPLIER
+    // PAY SUPPLIER (FIFO + advance support)
     // =========================
-
     async paySupplier(dto: PaySupplierDto) {
         return await this.prisma.$transaction(
             async (tx) => {
-                // 1. Load all purchases
-                const purchases = await tx.purchases.findMany({
-                    where: { Id: { in: dto.purchaseIds } },
-                    include: { Suppliers: true },
+                // 1. Resolve supplier + eligible purchases
+                let supplierId: string;
+                let eligiblePurchases: any[] = [];
+
+                if (dto.purchaseIds && dto.purchaseIds.length > 0) {
+                    eligiblePurchases = await tx.purchases.findMany({
+                        where: {
+                            Id: { in: dto.purchaseIds },
+                            BalanceAmount: { gt: 0 },
+                        },
+                        orderBy: { PurchaseDate: 'asc' },
+                    });
+
+                    if (eligiblePurchases.length !== dto.purchaseIds.length) {
+                        throw new BadRequestException(
+                            'Some selected purchases are not eligible (no balance or not found)'
+                        );
+                    }
+
+                    const supplierIds = new Set(
+                        eligiblePurchases.map((p) => p.SupplierId)
+                    );
+                    if (supplierIds.size > 1) {
+                        throw new BadRequestException(
+                            'All selected purchases must belong to the same supplier'
+                        );
+                    }
+
+                    supplierId = eligiblePurchases[0].SupplierId;
+                } else if (dto.supplierId) {
+                    supplierId = dto.supplierId;
+
+                    eligiblePurchases = await tx.purchases.findMany({
+                        where: {
+                            SupplierId: dto.supplierId,
+                            BalanceAmount: { gt: 0 },
+                            Status: { not: 3 },
+                        },
+                        orderBy: { PurchaseDate: 'asc' },
+                    });
+                } else {
+                    throw new BadRequestException(
+                        'Either supplierId or purchaseIds is required'
+                    );
+                }
+
+                // 2. Verify supplier
+                const supplier = await tx.suppliers.findUnique({
+                    where: { Id: supplierId },
                 });
-
-                if (purchases.length !== dto.purchaseIds.length) {
-                    throw new NotFoundException('One or more purchases not found');
+                if (!supplier) {
+                    throw new NotFoundException('Supplier not found');
                 }
 
-                // 2. Validate all belong to the same supplier
-                const supplierIds = new Set(purchases.map((p) => p.SupplierId));
-                if (supplierIds.size > 1) {
-                    throw new BadRequestException(
-                        'All selected purchases must belong to the same supplier'
-                    );
-                }
-
-                // 3. Validate at least one has outstanding balance
-                const unpaid = purchases
-                    .filter((p) => Number(p.BalanceAmount) > 0)
-                    .sort(
-                        (a, b) =>
-                            new Date(a.PurchaseDate).getTime() -
-                            new Date(b.PurchaseDate).getTime()
-                    );
-
-                if (unpaid.length === 0) {
-                    throw new BadRequestException(
-                        'Selected purchases have no outstanding balance'
-                    );
-                }
-
-                // 4. Determine total amount
-                const totalBalance = unpaid.reduce(
+                // 3. Total amount
+                const totalBalance = eligiblePurchases.reduce(
                     (s, p) => s + Number(p.BalanceAmount),
                     0
                 );
@@ -455,13 +441,8 @@ export class SuppliersService {
                 if (totalAmount <= 0) {
                     throw new BadRequestException('Invalid amount');
                 }
-                if (totalAmount > totalBalance) {
-                    throw new BadRequestException(
-                        `Exceeds total balance. Max: ${totalBalance}`
-                    );
-                }
 
-                // 5. Cheque validation
+                // 4. Cheque validation
                 if (dto.paymentMethod === 'Cheque') {
                     if (!dto.chequeNumber) {
                         throw new BadRequestException(
@@ -473,35 +454,48 @@ export class SuppliersService {
                     }
                 }
 
-                // 6. Allocate amount FIFO across purchases
+                // 5. FIFO allocation
                 let remaining = totalAmount;
-                const allocations: Array<{
-                    purchase: (typeof unpaid)[number];
-                    amount: number;
-                }> = [];
+                const allocations: Array<{ purchase: any; amount: number }> = [];
 
-                for (const purchase of unpaid) {
+                for (const purchase of eligiblePurchases) {
                     if (remaining <= 0) break;
-                    const pay = Math.min(
-                        Number(purchase.BalanceAmount),
-                        remaining
-                    );
-                    allocations.push({ purchase, amount: pay });
-                    remaining -= pay;
+                    const balance = Number(purchase.BalanceAmount);
+                    const alloc = Math.min(balance, remaining);
+                    allocations.push({ purchase, amount: alloc });
+                    remaining -= alloc;
                 }
 
-                // 7. Update each purchase + create one SupplierPayments row per purchase
-                const paymentResults: Array<{
-                    purchaseId: string;
-                    invoiceNumber: string;
-                    amount: number;
-                    newPaidAmount: number;
-                    newBalanceAmount: number;
-                    paymentId: string;
-                }> = [];
+                const advancePortion = remaining;
+                const isCash = dto.paymentMethod === 'Cash';
+                const chequeDate = dto.chequeDate
+                    ? new Date(dto.chequeDate)
+                    : null;
+
+                // 6. Create purchase allocation rows
+                const createdPayments: any[] = [];
 
                 for (const { purchase, amount } of allocations) {
-                    const updatedPurchase = await tx.purchases.update({
+                    const payment = await tx.supplierPayments.create({
+                        data: {
+                            Id: randomUUID(),
+                            PurchaseId: purchase.Id,
+                            SupplierId: supplierId,     // ✅
+                            Amount: amount,
+                            PaymentMethod: dto.paymentMethod,
+                            PaidAt: new Date(),
+                            Status: isCash ? 'Cleared' : 'Pending',
+                            ClearedAt: isCash ? new Date() : null,
+                            ChequeNumber:
+                                dto.paymentMethod === 'Cheque'
+                                    ? dto.chequeNumber
+                                    : null,
+                            ChequeDate: chequeDate,
+                            Notes: dto.notes || null,
+                        },
+                    });
+
+                    await tx.purchases.update({
                         where: { Id: purchase.Id },
                         data: {
                             PaidAmount: { increment: amount },
@@ -509,41 +503,65 @@ export class SuppliersService {
                         },
                     });
 
-                    const payment = await tx.supplierPayments.create({
+                    createdPayments.push({
+                        PaymentId: payment.Id,
+                        PurchaseId: purchase.Id,
+                        InvoiceNumber: purchase.InvoiceNumber,
+                        Amount: amount,
+                        IsAdvance: false,
+                    });
+                }
+
+                // 7. Advance portion (overpayment)
+                if (advancePortion > 0) {
+                    const advancePayment = await tx.supplierPayments.create({
                         data: {
-                            Id: crypto.randomUUID(),
-                            PurchaseId: purchase.Id,
-                            Amount: amount,
+                            Id: randomUUID(),
+                            PurchaseId: null,
+                            SupplierId: supplierId,     // ✅
+                            Amount: advancePortion,
                             PaymentMethod: dto.paymentMethod,
                             PaidAt: new Date(),
-                            Status:
-                                dto.paymentMethod === 'Cash'
-                                    ? 'Cleared'
-                                    : 'Pending',
+                            Status: isCash ? 'Cleared' : 'Pending',
+                            ClearedAt: isCash ? new Date() : null,
                             ChequeNumber:
                                 dto.paymentMethod === 'Cheque'
                                     ? dto.chequeNumber
                                     : null,
-                            ChequeDate:
-                                dto.paymentMethod === 'Cheque' && dto.chequeDate
-                                    ? new Date(dto.chequeDate)
-                                    : null,
-                            Notes: dto.notes || null,
+                            ChequeDate: chequeDate,
+                            Notes: dto.notes || 'Advance payment',
                         },
                     });
 
-                    paymentResults.push({
-                        purchaseId: purchase.Id,
-                        invoiceNumber: purchase.InvoiceNumber,
-                        amount,
-                        newPaidAmount: Number(updatedPurchase.PaidAmount),
-                        newBalanceAmount: Number(updatedPurchase.BalanceAmount),
-                        paymentId: payment.Id,
+                    // Cash → immediately available advance
+                    // Cheque → held as pending until cleared
+                    if (isCash) {
+                        await tx.suppliers.update({
+                            where: { Id: supplierId },
+                            data: {
+                                AdvanceBalance: { increment: advancePortion },
+                            },
+                        });
+                    } else {
+                        await tx.suppliers.update({
+                            where: { Id: supplierId },
+                            data: {
+                                PendingAdvance: { increment: advancePortion },
+                            },
+                        });
+                    }
+
+                    createdPayments.push({
+                        PaymentId: advancePayment.Id,
+                        PurchaseId: null,
+                        InvoiceNumber: null,
+                        Amount: advancePortion,
+                        IsAdvance: true,
                     });
                 }
 
-                // 8. Cash ledger — single entry for total (cash only)
-                if (dto.paymentMethod === 'Cash') {
+                // 8. Cash ledger — single OUT entry for the whole amount
+                if (isCash) {
                     const reference =
                         allocations.length === 1
                             ? allocations[0].purchase.InvoiceNumber
@@ -558,18 +576,28 @@ export class SuppliersService {
                     );
                 }
 
+                const allocatedToPurchases = totalAmount - advancePortion;
+
                 return {
                     message:
-                        dto.paymentMethod === 'Cheque'
-                            ? `Cheque recorded for ${allocations.length} purchase(s) — awaiting clearance`
-                            : `Cash payment recorded for ${allocations.length} purchase(s)`,
+                        advancePortion > 0
+                            ? `${dto.paymentMethod} payment — Rs ${allocatedToPurchases.toFixed(
+                                2
+                            )} across ${allocations.length
+                            } invoice(s), Rs ${advancePortion.toFixed(2)} held as ${isCash ? 'available' : 'pending'
+                            } advance`
+                            : `${dto.paymentMethod} payment — Rs ${totalAmount.toFixed(
+                                2
+                            )} across ${allocations.length} invoice(s)`,
+                    supplierId,
                     totalAmount,
-                    purchasesPaid: allocations.length,
-                    status:
-                        dto.paymentMethod === 'Cash' ? 'Cleared' : 'Pending',
+                    allocatedToPurchases,
+                    advancePortion,
+                    purchaseCount: allocations.length,
+                    status: isCash ? 'Cleared' : 'Pending',
                     chequeNumber: dto.chequeNumber || null,
                     chequeDate: dto.chequeDate || null,
-                    payments: paymentResults,
+                    payments: createdPayments,
                 };
             },
             {
@@ -710,175 +738,217 @@ export class SuppliersService {
     // =========================
 
     async clearCheque(id: string) {
-
-
-
-        const payment =
-            await this.prisma.supplierPayments.findUnique({
-
-                where: {
-                    Id: id
-                },
-
-                include: {
-                    Purchases: true
-                }
-
-            });
-
-
-
-        if (!payment)
-            throw new NotFoundException();
-
-
-
-        if (payment.Status === "Cleared")
-            throw new BadRequestException(
-                "Already cleared"
-            );
-
-
-
-        await this.prisma.supplierPayments.update({
-
-            where: {
-                Id: id
-            },
-
-            data: {
-
-
-                Status: "Cleared",
-
-                ClearedAt: new Date()
-
-
-            }
-
+        const cheque = await this.prisma.supplierPayments.findUnique({
+            where: { Id: id },
+            include: { Purchases: true },
         });
 
-
-
-
-
-        if (!payment.CashLedgerPosted) {
-
-
-            await this.cashLedger.add(
-
-                "OUT",
-
-                Number(payment.Amount),
-
-                "CHEQUE_CLEARED",
-
-                payment.Purchases.InvoiceNumber,
-
-                `Cheque cleared ${payment.ChequeNumber}`
-
-            );
-
-
-
-            await this.prisma.supplierPayments.update({
-
-                where: {
-                    Id: id
-                },
-
-                data: {
-
-                    CashLedgerPosted: true
-
-                }
-
-
-            });
-
-
+        if (!cheque) {
+            throw new NotFoundException('Cheque not found');
         }
 
+        if (cheque.PaymentMethod !== 'Cheque') {
+            throw new BadRequestException('This payment is not a cheque');
+        }
 
+        if (cheque.Status === 'Cleared') {
+            throw new BadRequestException('Cheque already cleared');
+        }
 
+        if (cheque.Status === 'Bounced') {
+            throw new BadRequestException('Cheque was bounced — cannot clear');
+        }
 
-        return {
+        const amount = Number(cheque.Amount);
+        const isAdvance = cheque.PurchaseId === null;
 
-
-            Id: id,
-
-            Status: "Cleared",
-
-            ClearedAt: new Date()
-
-
-        };
-
-
-
-    }
-
-    async clearChequeByNumber(chequeNumber: string) {
         return await this.prisma.$transaction(async (tx) => {
-            const rows = await tx.supplierPayments.findMany({
-                where: {
-                    ChequeNumber: chequeNumber,
-                    PaymentMethod: 'Cheque',
+            // Mark cleared
+            const updated = await tx.supplierPayments.update({
+                where: { Id: id },
+                data: {
+                    Status: 'Cleared',
+                    ClearedAt: new Date(),
                 },
-                include: { Purchases: true },
             });
 
-            if (rows.length === 0) {
-                throw new NotFoundException(
-                    `No cheque payments found with number ${chequeNumber}`
-                );
-            }
+            if (isAdvance) {
+                const supplierId =
+                    cheque.SupplierId || cheque.Purchases?.SupplierId;
 
-            const pending = rows.filter((r) => r.Status !== 'Cleared');
-            if (pending.length === 0) {
-                throw new BadRequestException('Cheque already cleared');
-            }
-
-            let totalCleared = 0;
-
-            for (const row of pending) {
-                const amount = Number(row.Amount);
-                totalCleared += amount;
-
-                await tx.supplierPayments.update({
-                    where: { Id: row.Id },
-                    data: { Status: 'Cleared', ClearedAt: new Date() },
-                });
-
-                if (!row.CashLedgerPosted) {
-                    await this.cashLedger.add(
-                        'OUT',
-                        amount,
-                        'SUPPLIER_CHEQUE_CLEAR',
-                        row.Purchases.InvoiceNumber,
-                        `Cheque cleared for ${row.Purchases.InvoiceNumber} (Cheque #${chequeNumber})`
-                    );
-
-                    await tx.supplierPayments.update({
-                        where: { Id: row.Id },
-                        data: { CashLedgerPosted: true },
+                if (supplierId) {
+                    await tx.suppliers.update({
+                        where: { Id: supplierId },
+                        data: {
+                            PendingAdvance: { decrement: amount },
+                            AdvanceBalance: { increment: amount },
+                        },
                     });
                 }
+
+                await this.cashLedger.add(
+                    'OUT',
+                    amount,
+                    'SUPPLIER_CHEQUE_ADVANCE_CLEARED',
+                    cheque.ChequeNumber || 'N/A',
+                    `Advance portion of cheque #${cheque.ChequeNumber} cleared`
+                );
+            } else if (!cheque.CashLedgerPosted) {
+                await this.cashLedger.add(
+                    'OUT',
+                    amount,
+                    'SUPPLIER_CHEQUE_CLEARED',
+                    cheque.Purchases?.InvoiceNumber || 'N/A',
+                    `Cheque cleared for ${cheque.Purchases?.InvoiceNumber || 'N/A'
+                    }`
+                );
+
+                await tx.supplierPayments.update({
+                    where: { Id: id },
+                    data: { CashLedgerPosted: true },
+                });
             }
 
             return {
-                chequeNumber,
-                rowsCleared: pending.length,
-                totalCleared,
-                message: `Cheque cleared — Rs ${totalCleared} posted across ${pending.length} purchase(s)`,
+                message: isAdvance
+                    ? `Advance cleared — Rs ${amount} now available`
+                    : `Cheque cleared successfully`,
+                paymentId: updated.Id,
+                status: updated.Status,
+                isAdvance,
             };
         });
     }
 
+    // =========================
+    // CLEAR CHEQUE BY NUMBER (bulk)
+    // =========================
+    async clearChequeByNumber(chequeNumber: string) {
+        return await this.prisma.$transaction(
+            async (tx) => {
+                const rows = await tx.supplierPayments.findMany({
+                    where: {
+                        ChequeNumber: chequeNumber,
+                        PaymentMethod: 'Cheque',
+                    },
+                    include: { Purchases: true },
+                });
+
+                if (rows.length === 0) {
+                    throw new NotFoundException(
+                        `No cheque payments found with number ${chequeNumber}`
+                    );
+                }
+
+                const allCleared = rows.filter((r) => r.Status === 'Cleared');
+                if (allCleared.length === rows.length) {
+                    throw new BadRequestException('Cheque already cleared');
+                }
+
+                const bounced = rows.filter((r) => r.Status === 'Bounced');
+                if (bounced.length > 0) {
+                    throw new BadRequestException(
+                        'Cheque was bounced — cannot clear'
+                    );
+                }
+
+                const pending = rows.filter(
+                    (r) => r.Status !== 'Cleared' && r.Status !== 'Bounced'
+                );
+
+                // ✅ Fallback supplier id
+                const fallbackSupplierId =
+                    rows.find((r) => r.SupplierId)?.SupplierId ||
+                    rows.find((r) => r.Purchases?.SupplierId)?.Purchases
+                        ?.SupplierId ||
+                    null;
+
+                let totalCleared = 0;
+                let totalAdvance = 0;
+                let advanceSupplierId: string | null = null;
+
+                for (const row of pending) {
+                    const amount = Number(row.Amount);
+                    totalCleared += amount;
+
+                    const isAdvance = row.PurchaseId === null;
+
+                    await tx.supplierPayments.update({
+                        where: { Id: row.Id },
+                        data: {
+                            Status: 'Cleared',
+                            ClearedAt: new Date(),
+                        },
+                    });
+
+                    if (isAdvance) {
+                        totalAdvance += amount;
+                        const sid = row.SupplierId || fallbackSupplierId;
+                        if (sid && !advanceSupplierId) {
+                            advanceSupplierId = sid;
+                        }
+                    } else if (!row.CashLedgerPosted) {
+                        await this.cashLedger.add(
+                            'OUT',
+                            amount,
+                            'SUPPLIER_CHEQUE_CLEARED',
+                            row.Purchases?.InvoiceNumber || 'N/A',
+                            `Cheque cleared for ${row.Purchases?.InvoiceNumber || 'N/A'
+                            } (Cheque #${chequeNumber})`
+                        );
+
+                        await tx.supplierPayments.update({
+                            where: { Id: row.Id },
+                            data: { CashLedgerPosted: true },
+                        });
+                    }
+                }
+
+                // Move PendingAdvance → AdvanceBalance
+                if (totalAdvance > 0 && advanceSupplierId) {
+                    await tx.suppliers.update({
+                        where: { Id: advanceSupplierId },
+                        data: {
+                            PendingAdvance: { decrement: totalAdvance },
+                            AdvanceBalance: { increment: totalAdvance },
+                        },
+                    });
+                }
+
+                const invoicesCleared = pending.filter(
+                    (r) => r.PurchaseId !== null
+                ).length;
+
+                return {
+                    chequeNumber,
+                    rowsCleared: pending.length,
+                    invoicesCleared,
+                    totalCleared,
+                    advanceCleared: totalAdvance,
+                    message:
+                        totalAdvance > 0
+                            ? `Cheque cleared — Rs ${(
+                                totalCleared - totalAdvance
+                            ).toFixed(
+                                2
+                            )} across ${invoicesCleared} purchase(s), Rs ${totalAdvance.toFixed(
+                                2
+                            )} moved to available advance`
+                            : `Cheque cleared — Rs ${totalCleared.toFixed(
+                                2
+                            )} across ${invoicesCleared} purchase(s)`,
+                };
+            },
+            {
+                timeout: 30000,
+                maxWait: 15000,
+            }
+        );
+    }
 
 
     // =========================
-    // BOUNCE CHEQUE BY NUMBER (multi-invoice)
+    // BOUNCE CHEQUE BY NUMBER (bulk)
     // =========================
     async bounceChequeByNumber(chequeNumber: string, reason?: string) {
         return await this.prisma.$transaction(
@@ -904,32 +974,38 @@ export class SuppliersService {
                     );
                 }
 
-                const alreadyBounced = rows.filter((r) => r.Status === 'Bounced');
+                const alreadyBounced = rows.filter(
+                    (r) => r.Status === 'Bounced'
+                );
                 if (alreadyBounced.length === rows.length) {
                     throw new BadRequestException(
                         'Cheque already marked as bounced'
                     );
                 }
 
-                const pending = rows.filter((r) => r.Status !== 'Bounced');
+                const pending = rows.filter(
+                    (r) => r.Status !== 'Cleared' && r.Status !== 'Bounced'
+                );
+
+                // ✅ Fallback supplier id
+                const fallbackSupplierId =
+                    rows.find((r) => r.SupplierId)?.SupplierId ||
+                    rows.find((r) => r.Purchases?.SupplierId)?.Purchases
+                        ?.SupplierId ||
+                    null;
 
                 let totalReversed = 0;
+                let totalAdvanceReversed = 0;
+                let advanceSupplierId: string | null = null;
+                let invoicesBounced = 0;
 
                 for (const row of pending) {
                     const amount = Number(row.Amount);
                     totalReversed += amount;
 
-                    // 1. Reverse the purchase balance
-                    await tx.purchases.update({
-                        where: { Id: row.PurchaseId },
-                        data: {
-                            PaidAmount: { decrement: amount },
-                            BalanceAmount: { increment: amount },
-                        },
-                    });
+                    const isAdvance = row.PurchaseId === null;
 
-                    // 2. Mark the payment row as bounced
-                    const combinedNotes = reason
+                    const combinedNote = reason
                         ? `${row.Notes || ''} | BOUNCED: ${reason}`.trim()
                         : `${row.Notes || ''} | BOUNCED`.trim();
 
@@ -938,7 +1014,35 @@ export class SuppliersService {
                         data: {
                             Status: 'Bounced',
                             ClearedAt: null,
-                            Notes: combinedNotes,
+                            Notes: combinedNote,
+                        },
+                    });
+
+                    if (isAdvance) {
+                        totalAdvanceReversed += amount;
+                        const sid = row.SupplierId || fallbackSupplierId;
+                        if (sid && !advanceSupplierId) {
+                            advanceSupplierId = sid;
+                        }
+                    } else {
+                        invoicesBounced++;
+
+                        await tx.purchases.update({
+                            where: { Id: row.PurchaseId! },
+                            data: {
+                                PaidAmount: { decrement: amount },
+                                BalanceAmount: { increment: amount },
+                            },
+                        });
+                    }
+                }
+
+                // Reverse PendingAdvance
+                if (totalAdvanceReversed > 0 && advanceSupplierId) {
+                    await tx.suppliers.update({
+                        where: { Id: advanceSupplierId },
+                        data: {
+                            PendingAdvance: { decrement: totalAdvanceReversed },
                         },
                     });
                 }
@@ -946,8 +1050,21 @@ export class SuppliersService {
                 return {
                     chequeNumber,
                     rowsBounced: pending.length,
+                    invoicesBounced,
                     totalReversed,
-                    message: `Cheque bounced — Rs ${totalReversed} re-added to supplier outstanding across ${pending.length} purchase(s)`,
+                    advanceReversed: totalAdvanceReversed,
+                    message:
+                        totalAdvanceReversed > 0
+                            ? `Cheque bounced — Rs ${(
+                                totalReversed - totalAdvanceReversed
+                            ).toFixed(
+                                2
+                            )} re-added to outstanding across ${invoicesBounced} purchase(s), Rs ${totalAdvanceReversed.toFixed(
+                                2
+                            )} pending advance removed`
+                            : `Cheque bounced — Rs ${totalReversed.toFixed(
+                                2
+                            )} re-added to outstanding across ${invoicesBounced} purchase(s)`,
                 };
             },
             {

@@ -46,17 +46,18 @@ model Categories2 {
 
 model CreditPayments {
   Id     String   @id(map: "PK_CreditPayments") @db.Uuid
-  SaleId String   @db.Uuid
+  SaleId String?   @db.Uuid
   Amount Decimal  @db.Decimal
   PaidAt DateTime @db.Timestamptz(6)
+  CustomerId    String?   @db.Uuid   // ✅ NEW
   Note   String?
   PaymentMethod String   @default("cash")  // 'cash' | 'card' | 'cheque' | 'bank_transfer'
   Reference     String?                     // cheque number, bank ref, card ref
   ChequeDate    DateTime? @db.Timestamptz(6) // only when method = 'cheque'
   Status        String   @default("cleared") // 'pending' | 'cleared' | 'bounced' — mostly for cheque
   ClearedAt     DateTime? @db.Timestamptz(6) // when a pending cheque is confirmed
-  Sales  Sales    @relation(fields: [SaleId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_CreditPayments_Sales_SaleId")
-
+  Sales  Sales?    @relation(fields: [SaleId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_CreditPayments_Sales_SaleId")
+  Customers Customers? @relation(fields: [CustomerId], references: [Id], onDelete: SetNull, onUpdate: NoAction, map: "FK_CreditPayments_Customers_CustomerId")
   @@index([SaleId], map: "IX_CreditPayments_SaleId")
 }
 
@@ -90,6 +91,9 @@ model Customers {
   State                 String?
   PostalCode            String?
   Country               String?                 @default("Bangladesh")
+  AdvanceBalance   Decimal @default(0.0) @db.Decimal   // ✅ NEW — usable overpayment
+  PendingAdvance   Decimal @default(0.0) @db.Decimal   // ✅ NEW — overpayment from pending cheque
+  IsTestCustomer Boolean  @default(false)  // adjust as needed
   
   // Additional contact info
   AlternativePhone      String?
@@ -129,6 +133,7 @@ model Customers {
   CustomerLedgerEntries CustomerLedgerEntries[]
   Sales                 Sales[]
   Quotations            Quotations[]
+  CreditPayments CreditPayments[]   // ✅ add this
 }
 
 // Add enum for customer type
@@ -289,7 +294,8 @@ model Sales {
 
 model SupplierPayments {
   Id               String    @id(map: "PK_SupplierPayments") @db.Uuid
-  PurchaseId       String    @db.Uuid
+  PurchaseId       String?    @db.Uuid
+  SupplierId       String?   @db.Uuid  
   Amount           Decimal   @db.Decimal
   PaymentMethod    String
   PaidAt           DateTime  @db.Timestamptz(6)
@@ -299,9 +305,13 @@ model SupplierPayments {
   ChequeNumber     String?
   ChequeDate       DateTime? @db.Timestamptz(6)
   Notes            String?
-  Purchases        Purchases @relation(fields: [PurchaseId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_SupplierPayments_Purchases_PurchaseId")
+  Purchases        Purchases? @relation(fields: [PurchaseId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_SupplierPayments_Purchases_PurchaseId")
+  Suppliers        Suppliers? @relation(fields: [SupplierId], references: [Id], onDelete: SetNull, onUpdate: NoAction, map: "FK_SupplierPayments_Suppliers_SupplierId")
 
   @@index([PurchaseId], map: "IX_SupplierPayments_PurchaseId")
+  @@index([SupplierId])                 // ✅ NEW
+  @@index([ChequeNumber])               // ✅ NEW — for fast reference lookups
+  @@index([Status])     
 }
 
 model Suppliers {
@@ -312,6 +322,9 @@ model Suppliers {
   Address   String?
   CreatedAt DateTime    @db.Timestamptz(6)
   Purchases Purchases[]
+  AdvanceBalance Decimal @default(0.0) @db.Decimal   // ✅ we overpaid; supplier owes us
+  PendingAdvance Decimal @default(0.0) @db.Decimal   // ✅ from pending cheques
+  SupplierPayments SupplierPayments[]                // ✅ relation
 }
 
 model Users {

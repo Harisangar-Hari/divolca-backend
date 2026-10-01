@@ -191,6 +191,8 @@ export class CustomersService {
       UpdatedAt: customer.UpdatedAt,
       LastPurchaseDate: customer.LastPurchaseDate,
       LastPaymentDate: customer.LastPaymentDate,
+      AdvanceBalance: customer.AdvanceBalance || 0,     // ✅ NEW
+      PendingAdvance: customer.PendingAdvance || 0,     // ✅ NEW
       Sales: customer.Sales.map(s => ({
         Id: s.Id,
         InvoiceNumber: s.InvoiceNumber,
@@ -453,7 +455,7 @@ export class CustomersService {
         Sales: {
           where: {
             BalanceAmount: { gt: 0 },
-            Status: { not: 1 } // Exclude completed/cancelled
+            Status: { not: 4 } // Exclude completed/cancelled
           }
         }
       }

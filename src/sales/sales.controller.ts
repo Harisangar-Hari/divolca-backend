@@ -25,6 +25,7 @@ import {
 } from './dto/checkout.dto';
 import { Permissions } from '../auth/decorators/permissions.decorator';
 import { DeliveryCollectionDto } from './dto/delivery-collection.dto';
+import { RecordChequeWithAmountDto } from './dto/record-cheque-with-amount.dto';
 
 @Controller('sales')
 export class SalesController {
@@ -263,6 +264,19 @@ export class SalesController {
         @Body() dto: DeliveryCollectionDto
     ) {
         return this.salesService.recordDeliveryCollection(id, dto);
+    }
+
+
+    // =========================
+    // ✅ RECORD CHEQUE WITH AMOUNT (FIFO or selected invoices)
+    // =========================
+    @Post('credit-cheques/with-amount')
+    @Permissions('canManageCreditPayments')
+    @HttpCode(HttpStatus.CREATED)
+    async recordCreditChequeWithAmount(
+        @Body() dto: RecordChequeWithAmountDto
+    ) {
+        return this.salesService.recordCreditChequeWithAmount(dto);
     }
 
 

@@ -246,85 +246,41 @@ export class ChequeDashboardService {
 
 
     async getPendingCheques() {
-
-
         const { start } = this.getDateRange();
 
-
-        const result =
-            await this.prisma.supplierPayments.findMany({
-
-                where: {
-
-                    PaymentMethod: "Cheque",
-
-                    Status: "Pending"
-
+        const result = await this.prisma.supplierPayments.findMany({
+            where: {
+                PaymentMethod: 'Cheque',
+                Status: 'Pending',
+            },
+            orderBy: {
+                ChequeDate: 'asc',
+            },
+            include: {
+                Purchases: {
+                    include: { Suppliers: true },
                 },
+                Suppliers: true,        // ✅ add
+            },
+        });
 
-
-                orderBy: {
-                    ChequeDate: "asc"
-                },
-
-
-                include: {
-
-                    Purchases: {
-                        include: {
-                            Suppliers: true
-                        }
-                    }
-
-                }
-
-            });
-
-
-
-        return result.map(x => ({
-
-
+        return result.map((x) => ({
             Id: x.Id,
-
-
             supplierName:
-                x.Purchases.Suppliers.Name,
-
-
-            invoice:
-                x.Purchases.InvoiceNumber,
-
-
+                x.Suppliers?.Name ||
+                x.Purchases?.Suppliers?.Name ||
+                'Unknown',
+            invoice: x.Purchases?.InvoiceNumber || null,
             Amount: x.Amount,
-
-
             ChequeNumber: x.ChequeNumber,
-
-
             ChequeDate: x.ChequeDate,
-
-
-
-            daysLeft:
-                x.ChequeDate
-                    ?
-                    Math.ceil(
-                        (
-                            x.ChequeDate.getTime()
-                            -
-                            start.getTime()
-                        )
-                        /
-                        (1000 * 60 * 60 * 24)
-                    )
-                    :
-                    null
-
-
+            daysLeft: x.ChequeDate
+                ? Math.ceil(
+                    (x.ChequeDate.getTime() - start.getTime()) /
+                    (1000 * 60 * 60 * 24)
+                )
+                : null,
         }));
-
-
     }
 
 
@@ -337,64 +293,35 @@ export class ChequeDashboardService {
 
 
     async getOverdueCheques() {
-
-
         const { start } = this.getDateRange();
 
-
-
-        const result =
-            await this.prisma.supplierPayments.findMany({
-
-                where: {
-
-                    PaymentMethod: "Cheque",
-
-                    Status: "Pending",
-
-                    ChequeDate: {
-                        lt: start
-                    }
-
+        const result = await this.prisma.supplierPayments.findMany({
+            where: {
+                PaymentMethod: 'Cheque',
+                Status: 'Pending',
+                ChequeDate: {
+                    lt: start,
                 },
+            },
+            include: {
+                Purchases: {
+                    include: { Suppliers: true },
+                },
+                Suppliers: true,        // ✅ add
+            },
+        });
 
-
-                include: {
-
-                    Purchases: {
-                        include: {
-                            Suppliers: true
-                        }
-                    }
-
-                }
-
-            });
-
-
-
-        return result.map(x => ({
-
-
+        return result.map((x) => ({
             Id: x.Id,
-
-
             supplier:
-                x.Purchases.Suppliers.Name,
-
-
+                x.Suppliers?.Name ||
+                x.Purchases?.Suppliers?.Name ||
+                'Unknown',
+            invoice: x.Purchases?.InvoiceNumber || null,   // ✅ add — advance rows have no invoice
             Amount: x.Amount,
-
-
             ChequeNumber: x.ChequeNumber,
-
-
-            ChequeDate: x.ChequeDate
-
-
+            ChequeDate: x.ChequeDate,
         }));
-
-
     }
 
 
@@ -446,65 +373,36 @@ export class ChequeDashboardService {
 
 
     private formatChequeList(data: any[]) {
-
-        return data.map(x => ({
-
-
+        return data.map((x) => ({
             Id: x.Id,
-
             Amount: x.Amount,
-
             ChequeNumber: x.ChequeNumber,
-
             ChequeDate: x.ChequeDate,
-
-
             supplier:
-                x.Purchases.Suppliers.Name,
-
-
-            invoice:
-                x.Purchases.InvoiceNumber
-
-
+                x.Suppliers?.Name ||
+                x.Purchases?.Suppliers?.Name ||
+                "Unknown",
+            invoice: x.Purchases?.InvoiceNumber || null,
         }));
-
     }
 
-
-
     private formatClearedList(data: any[]) {
-
-
-        return data.map(x => ({
-
-
+        return data.map((x) => ({
             Id: x.Id,
-
             Amount: x.Amount,
-
             ClearedAt: x.ClearedAt,
-
             ChequeNumber: x.ChequeNumber,
-
             ChequeDate: x.ChequeDate,
-
-
             supplier:
-                x.Purchases.Suppliers.Name,
-
-
-            invoice:
-                x.Purchases.InvoiceNumber
-
-
+                x.Suppliers?.Name ||
+                x.Purchases?.Suppliers?.Name ||
+                "Unknown",
+            invoice: x.Purchases?.InvoiceNumber || null,
         }));
-
-
     }
 
     private formatBouncedList(data: any[]) {
-        return data.map(x => ({
+        return data.map((x) => ({
             Id: x.Id,
             Amount: x.Amount,
             ChequeNumber: x.ChequeNumber,

@@ -7,6 +7,7 @@ import { randomUUID } from 'crypto';
 import { CreateSaleReturnDto } from './dto/return-sale.dto';
 import { RecordBulkCreditChequeDto, RecordCreditChequeDto } from './dto/record-credit-cheque.dto';
 import { DeliveryCollectionDto } from './dto/delivery-collection.dto';
+import { RecordChequeWithAmountDto } from './dto/record-cheque-with-amount.dto';
 
 export enum PaymentMode {
     CASH = 'cash',
@@ -443,13 +444,8 @@ export class SalesService {
                 include: { Customers: true },
             });
 
-            if (!sale) {
-                throw new NotFoundException('Sale not found');
-            }
-
-            if (amount <= 0) {
-                throw new BadRequestException('Invalid amount');
-            }
+            if (!sale) throw new NotFoundException('Sale not found');
+            if (amount <= 0) throw new BadRequestException('Invalid amount');
 
             const balance = Number(sale.BalanceAmount);
             if (amount > balance) {
@@ -461,18 +457,19 @@ export class SalesService {
             const newBalance = balance - amount;
             const newPaid = Number(sale.PaidAmount) + amount;
 
-            // Record credit payment
             await tx.creditPayments.create({
                 data: {
                     Id: randomUUID(),
                     SaleId: sale.Id,
+                    CustomerId: sale.CustomerId,          // ✅ FIX
                     Amount: amount,
                     PaidAt: new Date(),
+                    PaymentMethod: 'cash',                // ✅
+                    Status: 'cleared',                    // ✅
                     Note: 'Credit payment received',
                 },
             });
 
-            // Record in sale payments
             await tx.salePayments.create({
                 data: {
                     Id: randomUUID(),
@@ -485,7 +482,6 @@ export class SalesService {
                 },
             });
 
-            // Update sale
             await tx.sales.update({
                 where: { Id: sale.Id },
                 data: {
@@ -495,7 +491,6 @@ export class SalesService {
                 },
             });
 
-            // Update customer ledger
             if (sale.CustomerId) {
                 await tx.customerLedgerEntries.create({
                     data: {
@@ -508,12 +503,8 @@ export class SalesService {
                         CreatedAt: new Date(),
                     },
                 });
-            }
 
-            // Update customer credit balance
-            if (sale.CustomerId) {
-
-
+                // Recalc CreditBalance
                 const unpaid = await tx.sales.aggregate({
                     where: {
                         CustomerId: sale.CustomerId,
@@ -526,13 +517,14 @@ export class SalesService {
                 await tx.customers.update({
                     where: { Id: sale.CustomerId },
                     data: {
-                        CreditBalance: Number(unpaid._sum.BalanceAmount || 0),
+                        CreditBalance: Number(
+                            unpaid._sum.BalanceAmount || 0
+                        ),
                         LastPaymentDate: new Date(),
                     },
                 });
             }
 
-            // Cash ledger entry
             await this.cashLedger.add(
                 'IN',
                 amount,
@@ -548,6 +540,7 @@ export class SalesService {
             };
         });
     }
+
 
     // ============================
     // RETURN ITEMS
@@ -2048,11 +2041,11 @@ export class SalesService {
                     );
                 }
 
-                // 1. Create pending cheque payment row
                 const payment = await tx.creditPayments.create({
                     data: {
                         Id: randomUUID(),
                         SaleId: sale.Id,
+                        CustomerId: sale.CustomerId,          // ✅ FIX
                         Amount: dto.amount,
                         PaidAt: new Date(),
                         Note: dto.note || 'Cheque payment received',
@@ -2064,7 +2057,6 @@ export class SalesService {
                     },
                 });
 
-                // 2. Reduce sale balance / increase paid
                 const newPaid = Number(sale.PaidAmount) + dto.amount;
                 const newBalance = Math.max(0, balance - dto.amount);
 
@@ -2077,7 +2069,6 @@ export class SalesService {
                     },
                 });
 
-                // 3. Customer ledger entry (pending)
                 if (sale.CustomerId) {
                     await tx.customerLedgerEntries.create({
                         data: {
@@ -2086,14 +2077,11 @@ export class SalesService {
                             SaleId: sale.Id,
                             Debit: dto.amount,
                             Credit: 0,
-                            Type: 'CHEQUE_PENDING',
+                            Type: `CHEQUE_PENDING (Cheque #${payment.Reference || payment.Id})`,
                             CreatedAt: new Date(),
                         },
                     });
                 }
-
-                // ⚠️ NO cash ledger entry yet
-                // ⚠️ NO salePayments row yet
 
                 return {
                     message: 'Cheque recorded — awaiting clearance',
@@ -2123,40 +2111,46 @@ export class SalesService {
             where,
             include: {
                 Sales: {
-                    include: {
-                        Customers: true,
-                    },
+                    include: { Customers: true },
                 },
+                Customers: true,   // ✅ include customer directly
             },
             orderBy: { PaidAt: 'desc' },
         });
 
-        return cheques.map((c) => ({
-            Id: c.Id,
-            SaleId: c.SaleId,
-            InvoiceNumber: c.Sales?.InvoiceNumber || null,
-            CustomerId: c.Sales?.CustomerId || null,
-            CustomerName: c.Sales?.Customers?.Name || 'Walk-in Customer',
-            CustomerPhone: c.Sales?.Customers?.Phone || null,
-            Amount: Number(c.Amount),
-            PaymentMethod: c.PaymentMethod,
-            Reference: c.Reference,
-            ChequeDate: c.ChequeDate,
-            Status: c.Status,
-            ClearedAt: c.ClearedAt,
-            PaidAt: c.PaidAt,
-            Note: c.Note,
-        }));
+        return cheques.map((c) => {
+            // Prefer the direct customer relation (works for both sale + advance rows)
+            const customer = c.Customers || c.Sales?.Customers;
+
+            return {
+                Id: c.Id,
+                SaleId: c.SaleId,
+                InvoiceNumber: c.Sales?.InvoiceNumber || null,
+
+                CustomerId: customer?.Id || null,          // ✅ from relation
+                CustomerName: customer?.Name || 'Walk-in Customer',
+                CustomerPhone: customer?.Phone || null,
+
+                Amount: Number(c.Amount),
+                PaymentMethod: c.PaymentMethod,
+                Reference: c.Reference,
+                ChequeDate: c.ChequeDate,
+                Status: c.Status,
+                ClearedAt: c.ClearedAt,
+                PaidAt: c.PaidAt,
+                Note: c.Note,
+            };
+        });
     }
 
     // ============================================================
-    // ✅ CLEAR A PENDING CHEQUE
+    // ✅ CLEAR A PENDING CHEQUE (single row)
     // ============================================================
-    async clearCreditCheque(paymentId: string) {
+    async clearCreditCheque(id: string) {
         return await this.prisma.$transaction(
             async (tx) => {
                 const payment = await tx.creditPayments.findUnique({
-                    where: { Id: paymentId },
+                    where: { Id: id },
                     include: { Sales: true },
                 });
 
@@ -2179,44 +2173,92 @@ export class SalesService {
                 }
 
                 const amount = Number(payment.Amount);
+                const isAdvance = payment.SaleId === null;
+
+                // ✅ Fallback customer id
+                const customerId =
+                    payment.CustomerId ||
+                    payment.Sales?.CustomerId ||
+                    null;
 
                 // 1. Mark cleared
                 const updated = await tx.creditPayments.update({
-                    where: { Id: paymentId },
+                    where: { Id: id },
                     data: {
                         Status: 'cleared',
                         ClearedAt: new Date(),
                     },
                 });
 
-                // 2. Post to cash ledger
-                await this.cashLedger.add(
-                    'IN',
-                    amount,
-                    'CREDIT_CHEQUE_CLEARED',
-                    payment.Sales.InvoiceNumber,
-                    `Cheque cleared for ${payment.Sales.InvoiceNumber}${payment.Reference ? ` (Cheque #${payment.Reference})` : ''
-                    }`
-                );
+                if (isAdvance) {
+                    // ============ ADVANCE ROW ============
+                    if (customerId) {
+                        await tx.customers.update({
+                            where: { Id: customerId },
+                            data: {
+                                PendingAdvance: { decrement: amount },
+                                AdvanceBalance: { increment: amount },
+                            },
+                        });
 
-                // 3. Record in sale payments now that it's cleared
-                await tx.salePayments.create({
-                    data: {
-                        Id: randomUUID(),
-                        SaleId: payment.SaleId,
-                        PaymentMode: 'cheque',
-                        Amount: amount,
-                        PaidAt: new Date(),
-                        Status: 'completed',
-                        Reference: payment.Reference || null,
-                    },
-                });
+                        // ✅ Memo entry for customer ledger
+                        await tx.customerLedgerEntries.create({
+                            data: {
+                                Id: randomUUID(),
+                                CustomerId: customerId,
+                                SaleId: null,
+                                Debit: 0,
+                                Credit: 0,
+                                Type: 'CHEQUE_ADVANCE_CLEARED',
+                                CreatedAt: new Date(),
+                            },
+                        });
+                    }
+
+                    await this.cashLedger.add(
+                        'IN',
+                        amount,
+                        `CREDIT_CHEQUE_ADVANCE_CLEARED (Cheque #${payment.Reference || payment.Id})`,
+                        payment.Reference || 'ADVANCE',
+                        `Advance portion of cheque #${payment.Reference || payment.Id
+                        } cleared`
+                    );
+                } else {
+                    // ============ SALE ROW ============
+                    const sale = payment.Sales!;
+
+                    await this.cashLedger.add(
+                        'IN',
+                        amount,
+                        `CREDIT_CHEQUE_CLEARED (Cheque #${payment.Reference || payment.Id})`,
+                        sale.InvoiceNumber,
+                        `Cheque cleared for ${sale.InvoiceNumber}${payment.Reference
+                            ? ` (Cheque #${payment.Reference})`
+                            : ''
+                        }`
+                    );
+
+                    await tx.salePayments.create({
+                        data: {
+                            Id: randomUUID(),
+                            SaleId: payment.SaleId!,
+                            PaymentMode: 'cheque',
+                            Amount: amount,
+                            PaidAt: new Date(),
+                            Status: 'completed',
+                            Reference: payment.Reference || null,
+                        },
+                    });
+                }
 
                 return {
                     Id: updated.Id,
                     Status: updated.Status,
                     ClearedAt: updated.ClearedAt,
-                    message: `Cheque cleared — Rs ${amount} posted to cash ledger`,
+                    IsAdvance: isAdvance,
+                    message: isAdvance
+                        ? `Advance cleared — Rs ${amount} now available`
+                        : `Cheque cleared — Rs ${amount} posted to cash ledger`,
                 };
             },
             { timeout: 30000, maxWait: 15000 }
@@ -2224,7 +2266,7 @@ export class SalesService {
     }
 
     // ============================================================
-    // ✅ BOUNCE A PENDING CHEQUE
+    // ✅ BOUNCE A PENDING CHEQUE (single row)
     // ============================================================
     async bounceCreditCheque(paymentId: string, reason?: string) {
         return await this.prisma.$transaction(
@@ -2243,7 +2285,9 @@ export class SalesService {
                 }
 
                 if (payment.Status === 'cleared') {
-                    throw new BadRequestException('Cannot bounce a cleared cheque');
+                    throw new BadRequestException(
+                        'Cannot bounce a cleared cheque'
+                    );
                 }
 
                 if (payment.Status === 'bounced') {
@@ -2253,22 +2297,14 @@ export class SalesService {
                 }
 
                 const amount = Number(payment.Amount);
-                const sale = payment.Sales;
+                const isAdvance = payment.SaleId === null;
 
-                // 1. Reverse sale paid / balance
-                const newPaid = Math.max(0, Number(sale.PaidAmount) - amount);
-                const newBalance = Number(sale.BalanceAmount) + amount;
+                // ✅ Fallback customer id
+                const customerId =
+                    payment.CustomerId ||
+                    payment.Sales?.CustomerId ||
+                    null;
 
-                await tx.sales.update({
-                    where: { Id: sale.Id },
-                    data: {
-                        PaidAmount: newPaid,
-                        BalanceAmount: newBalance,
-                        IsCreditSale: true,
-                    },
-                });
-
-                // 2. Mark payment bounced
                 const combinedNote = reason
                     ? `${payment.Note || ''} | BOUNCED: ${reason}`.trim()
                     : `${payment.Note || ''} | BOUNCED`.trim();
@@ -2282,7 +2318,52 @@ export class SalesService {
                     },
                 });
 
-                // 3. Reverse customer ledger
+                if (isAdvance) {
+                    // ============ ADVANCE ROW ============
+                    if (customerId) {
+                        await tx.customers.update({
+                            where: { Id: customerId },
+                            data: {
+                                PendingAdvance: { decrement: amount },
+                            },
+                        });
+
+                        await tx.customerLedgerEntries.create({
+                            data: {
+                                Id: randomUUID(),
+                                CustomerId: customerId,
+                                SaleId: null,
+                                Debit: 0,
+                                Credit: amount,
+                                Type: `CHEQUE_ADVANCE_BOUNCED (Cheque #${payment.Reference || payment.Id})`,
+                                CreatedAt: new Date(),
+                            },
+                        });
+                    }
+
+                    return {
+                        Id: paymentId,
+                        Status: 'bounced',
+                        IsAdvance: true,
+                        message: `Advance bounced — Rs ${amount} removed from pending`,
+                    };
+                }
+
+                // ============ SALE ROW ============
+                const sale = payment.Sales!;
+
+                const newPaid = Math.max(0, Number(sale.PaidAmount) - amount);
+                const newBalance = Number(sale.BalanceAmount) + amount;
+
+                await tx.sales.update({
+                    where: { Id: sale.Id },
+                    data: {
+                        PaidAmount: newPaid,
+                        BalanceAmount: newBalance,
+                        IsCreditSale: true,
+                    },
+                });
+
                 if (sale.CustomerId) {
                     await tx.customerLedgerEntries.create({
                         data: {
@@ -2291,8 +2372,26 @@ export class SalesService {
                             SaleId: sale.Id,
                             Debit: 0,
                             Credit: amount,
-                            Type: 'CHEQUE_BOUNCED',
+                            Type: `CHEQUE_BOUNCED (Cheque #${payment.Reference || payment.Id})`,
                             CreatedAt: new Date(),
+                        },
+                    });
+
+                    const unpaid = await tx.sales.aggregate({
+                        where: {
+                            CustomerId: sale.CustomerId,
+                            BalanceAmount: { gt: 0 },
+                            Status: { not: 4 },
+                        },
+                        _sum: { BalanceAmount: true },
+                    });
+
+                    await tx.customers.update({
+                        where: { Id: sale.CustomerId },
+                        data: {
+                            CreditBalance: Number(
+                                unpaid._sum.BalanceAmount || 0
+                            ),
                         },
                     });
                 }
@@ -2300,6 +2399,7 @@ export class SalesService {
                 return {
                     Id: paymentId,
                     Status: 'bounced',
+                    IsAdvance: false,
                     NewPaidAmount: newPaid,
                     NewBalanceAmount: newBalance,
                     message: `Cheque bounced — Rs ${amount} re-added to outstanding`,
@@ -2310,10 +2410,197 @@ export class SalesService {
     }
 
 
+    // ============================================================
+    // ✅ BOUNCE ALL ROWS FOR A CHEQUE REFERENCE (bulk)
+    // ============================================================
+    async bounceCreditChequesByReference(reference: string, reason?: string) {
+        return await this.prisma.$transaction(
+            async (tx) => {
+                const rows = await tx.creditPayments.findMany({
+                    where: {
+                        PaymentMethod: 'cheque',
+                        Reference: reference,
+                    },
+                    include: { Sales: true },
+                });
+
+                if (rows.length === 0) {
+                    throw new NotFoundException(
+                        `No cheque payments found with reference ${reference}`
+                    );
+                }
+
+                const cleared = rows.filter((r) => r.Status === 'cleared');
+                if (cleared.length > 0) {
+                    throw new BadRequestException(
+                        'Cannot bounce a cleared cheque'
+                    );
+                }
+
+                const alreadyBounced = rows.filter(
+                    (r) => r.Status === 'bounced'
+                );
+                if (alreadyBounced.length === rows.length) {
+                    throw new BadRequestException(
+                        'Cheque already marked as bounced'
+                    );
+                }
+
+                const pending = rows.filter((r) => r.Status === 'pending');
+
+                // ✅ Fallback customer id
+                const fallbackCustomerId =
+                    rows.find((r) => r.CustomerId)?.CustomerId ||
+                    rows.find((r) => r.Sales?.CustomerId)?.Sales?.CustomerId ||
+                    null;
+
+                let totalReversed = 0;
+                let bouncedCount = 0;
+                let totalAdvanceReversed = 0;
+                let advanceCustomerId: string | null = null;
+                const affectedCustomerIds = new Set<string>();
+
+                for (const row of pending) {
+                    const amount = Number(row.Amount);
+                    totalReversed += amount;
+                    bouncedCount++;
+
+                    const isAdvance = row.SaleId === null;
+
+                    const combinedNote = reason
+                        ? `${row.Note || ''} | BOUNCED: ${reason}`.trim()
+                        : `${row.Note || ''} | BOUNCED`.trim();
+
+                    await tx.creditPayments.update({
+                        where: { Id: row.Id },
+                        data: {
+                            Status: 'bounced',
+                            ClearedAt: null,
+                            Note: combinedNote,
+                        },
+                    });
+
+                    if (isAdvance) {
+                        // ============ ADVANCE ROW ============
+                        totalAdvanceReversed += amount;
+
+                        const custId = row.CustomerId || fallbackCustomerId;
+                        if (custId && !advanceCustomerId) {
+                            advanceCustomerId = custId;
+                        }
+
+                        if (custId) {
+                            await tx.customerLedgerEntries.create({
+                                data: {
+                                    Id: randomUUID(),
+                                    CustomerId: custId,
+                                    SaleId: null,
+                                    Debit: 0,
+                                    Credit: amount,
+                                    Type: 'CHEQUE_ADVANCE_BOUNCED',
+                                    CreatedAt: new Date(),
+                                },
+                            });
+                        }
+                    } else {
+                        // ============ SALE ROW ============
+                        const sale = row.Sales!;
+
+                        const newPaid = Math.max(
+                            0,
+                            Number(sale.PaidAmount) - amount
+                        );
+                        const newBalance =
+                            Number(sale.BalanceAmount) + amount;
+
+                        await tx.sales.update({
+                            where: { Id: sale.Id },
+                            data: {
+                                PaidAmount: newPaid,
+                                BalanceAmount: newBalance,
+                                IsCreditSale: true,
+                            },
+                        });
+
+                        if (sale.CustomerId) {
+                            affectedCustomerIds.add(sale.CustomerId);
+
+                            await tx.customerLedgerEntries.create({
+                                data: {
+                                    Id: randomUUID(),
+                                    CustomerId: sale.CustomerId,
+                                    SaleId: sale.Id,
+                                    Debit: 0,
+                                    Credit: amount,
+                                    Type: `CHEQUE_BOUNCED (Cheque #${reference})`,
+                                    CreatedAt: new Date(),
+                                },
+                            });
+                        }
+                    }
+                }
+
+                // Bulk update PendingAdvance
+                if (totalAdvanceReversed > 0 && advanceCustomerId) {
+                    await tx.customers.update({
+                        where: { Id: advanceCustomerId },
+                        data: {
+                            PendingAdvance: {
+                                decrement: totalAdvanceReversed,
+                            },
+                        },
+                    });
+                }
+
+                // Recalc CreditBalance per affected customer
+                for (const customerId of affectedCustomerIds) {
+                    const unpaid = await tx.sales.aggregate({
+                        where: {
+                            CustomerId: customerId,
+                            BalanceAmount: { gt: 0 },
+                            Status: { not: 4 },
+                        },
+                        _sum: { BalanceAmount: true },
+                    });
+
+                    await tx.customers.update({
+                        where: { Id: customerId },
+                        data: {
+                            CreditBalance: Number(
+                                unpaid._sum.BalanceAmount || 0
+                            ),
+                        },
+                    });
+                }
+
+                return {
+                    ChequeNumber: reference,
+                    InvoicesReversed: bouncedCount,
+                    TotalReversed: totalReversed,
+                    AdvanceReversed: totalAdvanceReversed,
+                    message:
+                        totalAdvanceReversed > 0
+                            ? `Cheque bounced — Rs ${(
+                                totalReversed - totalAdvanceReversed
+                            ).toFixed(
+                                2
+                            )} re-added to outstanding, Rs ${totalAdvanceReversed.toFixed(
+                                2
+                            )} pending advance removed`
+                            : `Cheque bounced — Rs ${totalReversed} re-added to outstanding across ${bouncedCount} invoice(s)`,
+                };
+            },
+            { timeout: 30000, maxWait: 15000 }
+        );
+    }
+
+
+
+
+
     async recordBulkCreditCheque(dto: RecordBulkCreditChequeDto) {
         return await this.prisma.$transaction(
             async (tx) => {
-                // 1. Fetch all selected sales, verify they belong to the same customer
                 const sales = await tx.sales.findMany({
                     where: { Id: { in: dto.saleIds } },
                     include: { Customers: true },
@@ -2339,7 +2626,6 @@ export class SalesService {
                     );
                 }
 
-                // 2. Verify every sale has an outstanding balance
                 const emptyBalances = sales.filter(
                     (s) => Number(s.BalanceAmount) <= 0
                 );
@@ -2351,7 +2637,6 @@ export class SalesService {
                     );
                 }
 
-                // 3. Compute total = sum of balances
                 const totalAmount = sales.reduce(
                     (sum, s) => sum + Number(s.BalanceAmount),
                     0
@@ -2366,18 +2651,17 @@ export class SalesService {
                 const chequeDate = new Date(dto.chequeDate);
                 const customerId = sales[0].CustomerId!;
 
-                // 4. Create one CreditPayments row per sale + reduce balance
                 const createdPayments: any[] = [];
 
                 for (const sale of sales) {
                     const amount = Number(sale.BalanceAmount);
                     const newPaid = Number(sale.PaidAmount) + amount;
-                    const newBalance = 0; // fully settled per Option X
 
                     const payment = await tx.creditPayments.create({
                         data: {
                             Id: randomUUID(),
                             SaleId: sale.Id,
+                            CustomerId: customerId,          // ✅ FIX
                             Amount: amount,
                             PaidAt: new Date(),
                             Note:
@@ -2395,7 +2679,7 @@ export class SalesService {
                         where: { Id: sale.Id },
                         data: {
                             PaidAmount: newPaid,
-                            BalanceAmount: newBalance,
+                            BalanceAmount: 0,
                             IsCreditSale: false,
                         },
                     });
@@ -2407,7 +2691,7 @@ export class SalesService {
                             SaleId: sale.Id,
                             Debit: amount,
                             Credit: 0,
-                            Type: 'CHEQUE_PENDING',
+                            Type: `CHEQUE_PENDING (Cheque #${payment.Reference || payment.Id})`,
                             CreatedAt: new Date(),
                         },
                     });
@@ -2435,7 +2719,7 @@ export class SalesService {
     }
 
     // ============================================================
-    // ✅ CLEAR ALL PENDING CHEQUE ROWS SHARING A REFERENCE
+    // ✅ CLEAR ALL ROWS FOR A CHEQUE REFERENCE (bulk)
     // ============================================================
     async clearCreditChequesByReference(reference: string) {
         return await this.prisma.$transaction(
@@ -2454,8 +2738,9 @@ export class SalesService {
                     );
                 }
 
-
-                const alreadyCleared = rows.filter((r) => r.Status === 'cleared');
+                const alreadyCleared = rows.filter(
+                    (r) => r.Status === 'cleared'
+                );
                 if (alreadyCleared.length === rows.length) {
                     throw new BadRequestException('Cheque already cleared');
                 }
@@ -2467,30 +2752,27 @@ export class SalesService {
                     );
                 }
 
+                const pending = rows.filter((r) => r.Status === 'pending');
+
+                // ✅ Fallback customer id — advance rows may have null CustomerId
+                const fallbackCustomerId =
+                    rows.find((r) => r.CustomerId)?.CustomerId ||
+                    rows.find((r) => r.Sales?.CustomerId)?.Sales?.CustomerId ||
+                    null;
+
                 let totalCleared = 0;
                 let clearedCount = 0;
+                let totalAdvance = 0;
+                let advanceCustomerId: string | null = null;
 
-                for (const row of rows) {
-                    if (row.Status !== 'pending') continue;
-
-                    if (row.Sales.CustomerId) {
-                        await tx.customerLedgerEntries.create({
-                            data: {
-                                Id: randomUUID(),
-                                CustomerId: row.Sales.CustomerId,
-                                SaleId: row.SaleId,
-                                Debit: 0,
-                                Credit: 0,
-                                Type: 'CHEQUE_CLEARED',
-                                CreatedAt: new Date(),
-                            },
-                        });
-                    }
-
+                for (const row of pending) {
                     const amount = Number(row.Amount);
                     totalCleared += amount;
                     clearedCount++;
 
+                    const isAdvance = row.SaleId === null;
+
+                    // 1. Mark cleared
                     await tx.creditPayments.update({
                         where: { Id: row.Id },
                         data: {
@@ -2499,23 +2781,88 @@ export class SalesService {
                         },
                     });
 
-                    await this.cashLedger.add(
-                        'IN',
-                        amount,
-                        'CREDIT_CHEQUE_CLEARED',
-                        row.Sales.InvoiceNumber,
-                        `Cheque cleared for ${row.Sales.InvoiceNumber} (Cheque #${reference})`
-                    );
+                    if (isAdvance) {
+                        // ============ ADVANCE ROW ============
+                        totalAdvance += amount;
 
-                    await tx.salePayments.create({
+                        const custId =
+                            row.CustomerId || fallbackCustomerId;
+                        if (custId && !advanceCustomerId) {
+                            advanceCustomerId = custId;
+                        }
+
+                        // ✅ Customer ledger memo entry (visibility)
+                        if (custId) {
+                            await tx.customerLedgerEntries.create({
+                                data: {
+                                    Id: randomUUID(),
+                                    CustomerId: custId,
+                                    SaleId: null,
+                                    Debit: 0,     // ✅ memo — no balance change
+                                    Credit: 0,    // ✅
+                                    Type: 'CHEQUE_ADVANCE_CLEARED',
+                                    CreatedAt: new Date(),
+                                },
+                            });
+                        }
+
+                        // Cash ledger IN
+                        await this.cashLedger.add(
+                            'IN',
+                            amount,
+                            `CREDIT_CHEQUE_ADVANCE_CLEARED (Cheque #${reference})`,
+                            reference,
+                            `Advance portion of cheque #${reference} cleared`
+                        );
+                    } else {
+                        // ============ SALE ROW ============
+                        const sale = row.Sales!;
+
+                        await this.cashLedger.add(
+                            'IN',
+                            amount,
+                            `CREDIT_CHEQUE_CLEARED (Cheque #${reference})`,
+                            sale.InvoiceNumber,
+                            `Cheque cleared for ${sale.InvoiceNumber} (Cheque #${reference})`
+                        );
+
+                        await tx.salePayments.create({
+                            data: {
+                                Id: randomUUID(),
+                                SaleId: row.SaleId!,
+                                PaymentMode: 'cheque',
+                                Amount: amount,
+                                PaidAt: new Date(),
+                                Status: 'completed',
+                                Reference: reference,
+                            },
+                        });
+
+                        // ✅ Memo entry for customer ledger (audit visibility)
+                        const custId = row.CustomerId || sale.CustomerId;
+                        if (custId) {
+                            await tx.customerLedgerEntries.create({
+                                data: {
+                                    Id: randomUUID(),
+                                    CustomerId: custId,
+                                    SaleId: row.SaleId!,
+                                    Debit: 0,
+                                    Credit: 0,
+                                    Type: `CHEQUE_CLEARED (Cheque #${reference})`,
+                                    CreatedAt: new Date(),
+                                },
+                            });
+                        }
+                    }
+                }
+
+                // ✅ Move PendingAdvance → AdvanceBalance
+                if (totalAdvance > 0 && advanceCustomerId) {
+                    await tx.customers.update({
+                        where: { Id: advanceCustomerId },
                         data: {
-                            Id: randomUUID(),
-                            SaleId: row.SaleId,
-                            PaymentMode: 'cheque',
-                            Amount: amount,
-                            PaidAt: new Date(),
-                            Status: 'completed',
-                            Reference: reference,
+                            PendingAdvance: { decrement: totalAdvance },
+                            AdvanceBalance: { increment: totalAdvance },
                         },
                     });
                 }
@@ -2524,112 +2871,24 @@ export class SalesService {
                     ChequeNumber: reference,
                     InvoicesCleared: clearedCount,
                     TotalCleared: totalCleared,
-                    message: `Cheque cleared — Rs ${totalCleared} posted across ${clearedCount} invoice(s)`,
+                    AdvanceCleared: totalAdvance,
+                    message:
+                        totalAdvance > 0
+                            ? `Cheque cleared — Rs ${(
+                                totalCleared - totalAdvance
+                            ).toFixed(
+                                2
+                            )} across ${clearedCount - 1
+                            } invoice(s), Rs ${totalAdvance.toFixed(
+                                2
+                            )} moved to available advance`
+                            : `Cheque cleared — Rs ${totalCleared} posted across ${clearedCount} invoice(s)`,
                 };
             },
             { timeout: 30000, maxWait: 15000 }
         );
     }
 
-    // ============================================================
-    // ✅ BOUNCE ALL PENDING CHEQUE ROWS SHARING A REFERENCE
-    // ============================================================
-    async bounceCreditChequesByReference(reference: string, reason?: string) {
-        return await this.prisma.$transaction(
-            async (tx) => {
-                const rows = await tx.creditPayments.findMany({
-                    where: {
-                        PaymentMethod: 'cheque',
-                        Reference: reference,
-                    },
-                    include: { Sales: true },
-                });
-
-                if (rows.length === 0) {
-                    throw new NotFoundException(
-                        `No cheque payments found with reference ${reference}`
-                    );
-                }
-
-                const cleared = rows.filter((r) => r.Status === 'cleared');
-                if (cleared.length > 0) {
-                    throw new BadRequestException(
-                        'Cannot bounce a cleared cheque'
-                    );
-                }
-
-                const alreadyBounced = rows.filter((r) => r.Status === 'bounced');
-                if (alreadyBounced.length === rows.length) {
-                    throw new BadRequestException(
-                        'Cheque already marked as bounced'
-                    );
-                }
-
-                let totalReversed = 0;
-                let bouncedCount = 0;
-
-                for (const row of rows) {
-                    if (row.Status !== 'pending') continue;
-
-                    const amount = Number(row.Amount);
-                    const sale = row.Sales;
-                    totalReversed += amount;
-                    bouncedCount++;
-
-                    // Reverse sale
-                    const newPaid = Math.max(
-                        0,
-                        Number(sale.PaidAmount) - amount
-                    );
-                    const newBalance = Number(sale.BalanceAmount) + amount;
-
-                    await tx.sales.update({
-                        where: { Id: sale.Id },
-                        data: {
-                            PaidAmount: newPaid,
-                            BalanceAmount: newBalance,
-                            IsCreditSale: true,
-                        },
-                    });
-
-                    const combinedNote = reason
-                        ? `${row.Note || ''} | BOUNCED: ${reason}`.trim()
-                        : `${row.Note || ''} | BOUNCED`.trim();
-
-                    await tx.creditPayments.update({
-                        where: { Id: row.Id },
-                        data: {
-                            Status: 'bounced',
-                            ClearedAt: null,
-                            Note: combinedNote,
-                        },
-                    });
-
-                    if (sale.CustomerId) {
-                        await tx.customerLedgerEntries.create({
-                            data: {
-                                Id: randomUUID(),
-                                CustomerId: sale.CustomerId,
-                                SaleId: sale.Id,
-                                Debit: 0,
-                                Credit: amount,
-                                Type: 'CHEQUE_BOUNCED',
-                                CreatedAt: new Date(),
-                            },
-                        });
-                    }
-                }
-
-                return {
-                    ChequeNumber: reference,
-                    InvoicesReversed: bouncedCount,
-                    TotalReversed: totalReversed,
-                    message: `Cheque bounced — Rs ${totalReversed} re-added to outstanding across ${bouncedCount} invoice(s)`,
-                };
-            },
-            { timeout: 30000, maxWait: 15000 }
-        );
-    }
 
 
     async getAllReturns(filters?: {
@@ -2702,123 +2961,345 @@ export class SalesService {
     }
 
     // ============================================================
-// ✅ RECORD DELIVERY COLLECTION
-// Applies a % discount to the CURRENT total, folds it into InvoiceDiscount,
-// stores the amount in DeliveryDiscount for reporting, and records the cash.
-// ============================================================
-async recordDeliveryCollection(
-    saleId: string,
-    dto: DeliveryCollectionDto
-) {
-    return await this.prisma.$transaction(
-        async (tx) => {
-            const sale = await tx.sales.findUnique({
-                where: { Id: saleId },
-                include: { Customers: true },
-            });
+    // ✅ RECORD DELIVERY COLLECTION
+    // Applies a % discount to the CURRENT total, folds it into InvoiceDiscount,
+    // stores the amount in DeliveryDiscount for reporting, and records the cash.
+    // ============================================================
+    async recordDeliveryCollection(
+        saleId: string,
+        dto: DeliveryCollectionDto
+    ) {
+        return await this.prisma.$transaction(
+            async (tx) => {
+                const sale = await tx.sales.findUnique({
+                    where: { Id: saleId },
+                    include: { Customers: true },
+                });
 
-            if (!sale) {
-                throw new NotFoundException('Sale not found');
-            }
+                if (!sale) {
+                    throw new NotFoundException('Sale not found');
+                }
 
-            if (sale.Status === 4) {
-                throw new BadRequestException(
-                    'Cannot collect payment for a cancelled sale'
+                if (sale.Status === 4) {
+                    throw new BadRequestException(
+                        'Cannot collect payment for a cancelled sale'
+                    );
+                }
+
+                if (sale.Status === 2) {
+                    throw new BadRequestException(
+                        'Cannot collect payment for a fully returned sale'
+                    );
+                }
+
+                const currentTotal = Number(sale.TotalAmount || 0);
+                const currentBalance = Number(sale.BalanceAmount || 0);
+
+                if (currentTotal <= 0) {
+                    throw new BadRequestException(
+                        'Sale has no amount to collect'
+                    );
+                }
+
+                if (currentBalance <= 0) {
+                    throw new BadRequestException(
+                        'Sale is already fully paid'
+                    );
+                }
+
+                // 1. Compute delivery discount on CURRENT net total
+                const deliveryDiscountAmount =
+                    Math.round(currentTotal * (dto.deliveryDiscountPercent / 100) * 100) / 100;
+
+                const newTotal = Math.max(
+                    0,
+                    currentTotal - deliveryDiscountAmount
                 );
-            }
 
-            if (sale.Status === 2) {
-                throw new BadRequestException(
-                    'Cannot collect payment for a fully returned sale'
-                );
-            }
+                // 2. Fold into InvoiceDiscount (for internal consistency)
+                const oldInvoiceDiscount = Number(sale.InvoiceDiscount || 0);
+                const newInvoiceDiscount =
+                    oldInvoiceDiscount + deliveryDiscountAmount;
 
-            const currentTotal = Number(sale.TotalAmount || 0);
-            const currentBalance = Number(sale.BalanceAmount || 0);
+                // 3. Validate cash collected
+                if (dto.cashCollected > newTotal) {
+                    throw new BadRequestException(
+                        `Cash collected (Rs ${dto.cashCollected}) exceeds the discounted total (Rs ${newTotal})`
+                    );
+                }
 
-            if (currentTotal <= 0) {
-                throw new BadRequestException(
-                    'Sale has no amount to collect'
-                );
-            }
+                // 4. Compute paid / balance
+                const oldPaid = Number(sale.PaidAmount || 0);
+                const newPaid = oldPaid + dto.cashCollected;
+                const newBalance = Math.max(0, newTotal - newPaid);
 
-            if (currentBalance <= 0) {
-                throw new BadRequestException(
-                    'Sale is already fully paid'
-                );
-            }
-
-            // 1. Compute delivery discount on CURRENT net total
-            const deliveryDiscountAmount =
-                Math.round(currentTotal * (dto.deliveryDiscountPercent / 100) * 100) / 100;
-
-            const newTotal = Math.max(
-                0,
-                currentTotal - deliveryDiscountAmount
-            );
-
-            // 2. Fold into InvoiceDiscount (for internal consistency)
-            const oldInvoiceDiscount = Number(sale.InvoiceDiscount || 0);
-            const newInvoiceDiscount =
-                oldInvoiceDiscount + deliveryDiscountAmount;
-
-            // 3. Validate cash collected
-            if (dto.cashCollected > newTotal) {
-                throw new BadRequestException(
-                    `Cash collected (Rs ${dto.cashCollected}) exceeds the discounted total (Rs ${newTotal})`
-                );
-            }
-
-            // 4. Compute paid / balance
-            const oldPaid = Number(sale.PaidAmount || 0);
-            const newPaid = oldPaid + dto.cashCollected;
-            const newBalance = Math.max(0, newTotal - newPaid);
-
-            // 5. Update sale
-            await tx.sales.update({
-                where: { Id: saleId },
-                data: {
-                    TotalAmount: newTotal,
-                    InvoiceDiscount: newInvoiceDiscount,
-                    DeliveryDiscount: deliveryDiscountAmount,
-                    PaidAmount: newPaid,
-                    BalanceAmount: newBalance,
-                    IsCreditSale: newBalance > 0,
-                },
-            });
-
-            // 6. Record SalePayment
-            await tx.salePayments.create({
-                data: {
-                    Id: randomUUID(),
-                    SaleId: saleId,
-                    PaymentMode: 'cash',
-                    Amount: dto.cashCollected,
-                    PaidAt: new Date(),
-                    Status: 'completed',
-                    Reference: dto.collectedBy
-                        ? `Delivery — ${dto.collectedBy}`
-                        : 'Delivery collection',
-                },
-            });
-
-            // 7. Customer ledger + credit balance recalc
-            if (sale.CustomerId) {
-                await tx.customerLedgerEntries.create({
+                // 5. Update sale
+                await tx.sales.update({
+                    where: { Id: saleId },
                     data: {
-                        Id: randomUUID(),
-                        CustomerId: sale.CustomerId,
-                        SaleId: saleId,
-                        Debit: dto.cashCollected,
-                        Credit: 0,
-                        Type: 'PAYMENT',
-                        CreatedAt: new Date(),
+                        TotalAmount: newTotal,
+                        InvoiceDiscount: newInvoiceDiscount,
+                        DeliveryDiscount: deliveryDiscountAmount,
+                        PaidAmount: newPaid,
+                        BalanceAmount: newBalance,
+                        IsCreditSale: newBalance > 0,
                     },
                 });
 
+                // 6. Record SalePayment
+                await tx.salePayments.create({
+                    data: {
+                        Id: randomUUID(),
+                        SaleId: saleId,
+                        PaymentMode: 'cash',
+                        Amount: dto.cashCollected,
+                        PaidAt: new Date(),
+                        Status: 'completed',
+                        Reference: dto.collectedBy
+                            ? `Delivery — ${dto.collectedBy}`
+                            : 'Delivery collection',
+                    },
+                });
+
+                // 7. Customer ledger + credit balance recalc
+                if (sale.CustomerId) {
+                    await tx.customerLedgerEntries.create({
+                        data: {
+                            Id: randomUUID(),
+                            CustomerId: sale.CustomerId,
+                            SaleId: saleId,
+                            Debit: dto.cashCollected,
+                            Credit: 0,
+                            Type: 'PAYMENT',
+                            CreatedAt: new Date(),
+                        },
+                    });
+
+                    const unpaid = await tx.sales.aggregate({
+                        where: {
+                            CustomerId: sale.CustomerId,
+                            BalanceAmount: { gt: 0 },
+                            Status: { not: 4 },
+                        },
+                        _sum: { BalanceAmount: true },
+                    });
+
+                    await tx.customers.update({
+                        where: { Id: sale.CustomerId },
+                        data: {
+                            CreditBalance: Number(
+                                unpaid._sum.BalanceAmount || 0
+                            ),
+                            LastPaymentDate: new Date(),
+                        },
+                    });
+                }
+
+                // 8. Cash ledger IN (only the real cash that arrived)
+                await this.cashLedger.add(
+                    'IN',
+                    dto.cashCollected,
+                    'DELIVERY_COLLECTION',
+                    sale.InvoiceNumber,
+                    `Delivery cash for ${sale.InvoiceNumber}${dto.collectedBy ? ` (${dto.collectedBy})` : ''
+                    }`
+                );
+
+                return {
+                    message: 'Delivery collection recorded',
+                    invoiceNumber: sale.InvoiceNumber,
+                    deliveryDiscountPercent: dto.deliveryDiscountPercent,
+                    deliveryDiscountAmount,
+                    oldTotal: currentTotal,
+                    newTotal,
+                    cashCollected: dto.cashCollected,
+                    newPaid,
+                    newBalance,
+                    collectedBy: dto.collectedBy || null,
+                };
+            },
+            {
+                timeout: 30000,
+                maxWait: 15000,
+            }
+        );
+    }
+
+    // ============================================================
+    // ✅ RECORD CHEQUE WITH AMOUNT
+    // Allocates FIFO across unpaid sales (or selected sales if provided).
+    // Overpayment becomes PendingAdvance (unusable until cheque clears).
+    // ============================================================
+    async recordCreditChequeWithAmount(dto: RecordChequeWithAmountDto) {
+        return await this.prisma.$transaction(
+            async (tx) => {
+                // 1. Load customer
+                const customer = await tx.customers.findUnique({
+                    where: { Id: dto.customerId },
+                });
+                if (!customer) {
+                    throw new NotFoundException('Customer not found');
+                }
+
+                if (dto.amount <= 0) {
+                    throw new BadRequestException('Invalid amount');
+                }
+                if (!dto.chequeNumber || !dto.chequeDate) {
+                    throw new BadRequestException(
+                        'Cheque number and date are required'
+                    );
+                }
+
+                // 2. Load eligible sales
+                let eligibleSales: any[] = [];
+
+                if (dto.saleIds && dto.saleIds.length > 0) {
+                    eligibleSales = await tx.sales.findMany({
+                        where: {
+                            Id: { in: dto.saleIds },
+                            CustomerId: dto.customerId,
+                            BalanceAmount: { gt: 0 },
+                            Status: { not: 4 },
+                        },
+                        orderBy: { CreatedAt: 'asc' },
+                    });
+
+                    if (eligibleSales.length !== dto.saleIds.length) {
+                        throw new BadRequestException(
+                            'One or more selected invoices are not eligible'
+                        );
+                    }
+                } else {
+                    eligibleSales = await tx.sales.findMany({
+                        where: {
+                            CustomerId: dto.customerId,
+                            BalanceAmount: { gt: 0 },
+                            Status: { not: 4 },
+                        },
+                        orderBy: { CreatedAt: 'asc' },
+                    });
+                }
+
+                // 3. FIFO allocation
+                let remaining = dto.amount;
+                const allocations: Array<{ sale: any; amount: number }> = [];
+
+                for (const sale of eligibleSales) {
+                    if (remaining <= 0) break;
+
+                    const balance = Number(sale.BalanceAmount);
+                    const alloc = Math.min(balance, remaining);
+
+                    allocations.push({ sale, amount: alloc });
+                    remaining -= alloc;
+                }
+
+                const advancePortion = remaining;
+
+                // 4. Create rows + reduce balances
+                const chequeDate = new Date(dto.chequeDate);
+                const createdPayments: any[] = [];
+
+                for (const { sale, amount } of allocations) {
+                    const payment = await tx.creditPayments.create({
+                        data: {
+                            Id: randomUUID(),
+                            SaleId: sale.Id,
+                            CustomerId: dto.customerId,        // ✅ FIX
+                            Amount: amount,
+                            PaidAt: new Date(),
+                            PaymentMethod: 'cheque',
+                            Reference: dto.chequeNumber,
+                            ChequeDate: chequeDate,
+                            Status: 'pending',
+                            ClearedAt: null,
+                            Note:
+                                dto.notes ||
+                                `Cheque payment for ${sale.InvoiceNumber}`,
+                        },
+                    });
+
+                    await tx.sales.update({
+                        where: { Id: sale.Id },
+                        data: {
+                            PaidAmount: { increment: amount },
+                            BalanceAmount: { decrement: amount },
+                        },
+                    });
+
+                    await tx.customerLedgerEntries.create({
+                        data: {
+                            Id: randomUUID(),
+                            CustomerId: dto.customerId,
+                            SaleId: sale.Id,
+                            Debit: amount,
+                            Credit: 0,
+                            Type: `CHEQUE_PENDING (Cheque #${payment.Reference || payment.Id})`,
+                            CreatedAt: new Date(),
+                        },
+                    });
+
+                    createdPayments.push({
+                        PaymentId: payment.Id,
+                        SaleId: sale.Id,
+                        InvoiceNumber: sale.InvoiceNumber,
+                        Amount: amount,
+                        IsAdvance: false,
+                    });
+                }
+
+                // 5. Advance portion
+                if (advancePortion > 0) {
+                    const advancePayment = await tx.creditPayments.create({
+                        data: {
+                            Id: randomUUID(),
+                            SaleId: null,
+                            CustomerId: dto.customerId,        // ✅ FIX
+                            Amount: advancePortion,
+                            PaidAt: new Date(),
+                            PaymentMethod: 'cheque',
+                            Reference: dto.chequeNumber,
+                            ChequeDate: chequeDate,
+                            Status: 'pending',
+                            ClearedAt: null,
+                            Note:
+                                dto.notes ||
+                                'Cheque overpayment — held as pending advance',
+                        },
+                    });
+
+                    await tx.customers.update({
+                        where: { Id: dto.customerId },
+                        data: {
+                            PendingAdvance: { increment: advancePortion },
+                        },
+                    });
+
+                    await tx.customerLedgerEntries.create({
+                        data: {
+                            Id: randomUUID(),
+                            CustomerId: dto.customerId,
+                            SaleId: null,
+                            Debit: advancePortion,
+                            Credit: 0,
+                            Type: 'CHEQUE_ADVANCE_PENDING',
+                            CreatedAt: new Date(),
+                        },
+                    });
+
+                    createdPayments.push({
+                        PaymentId: advancePayment.Id,
+                        SaleId: null,
+                        InvoiceNumber: null,
+                        Amount: advancePortion,
+                        IsAdvance: true,
+                    });
+                }
+
+                // 6. Recalculate CreditBalance
                 const unpaid = await tx.sales.aggregate({
                     where: {
-                        CustomerId: sale.CustomerId,
+                        CustomerId: dto.customerId,
                         BalanceAmount: { gt: 0 },
                         Status: { not: 4 },
                     },
@@ -2826,46 +3307,38 @@ async recordDeliveryCollection(
                 });
 
                 await tx.customers.update({
-                    where: { Id: sale.CustomerId },
+                    where: { Id: dto.customerId },
                     data: {
-                        CreditBalance: Number(
-                            unpaid._sum.BalanceAmount || 0
-                        ),
-                        LastPaymentDate: new Date(),
+                        CreditBalance: Number(unpaid._sum.BalanceAmount || 0),
                     },
                 });
-            }
 
-            // 8. Cash ledger IN (only the real cash that arrived)
-            await this.cashLedger.add(
-                'IN',
-                dto.cashCollected,
-                'DELIVERY_COLLECTION',
-                sale.InvoiceNumber,
-                `Delivery cash for ${sale.InvoiceNumber}${
-                    dto.collectedBy ? ` (${dto.collectedBy})` : ''
-                }`
-            );
+                const allocatedToInvoices = dto.amount - advancePortion;
 
-            return {
-                message: 'Delivery collection recorded',
-                invoiceNumber: sale.InvoiceNumber,
-                deliveryDiscountPercent: dto.deliveryDiscountPercent,
-                deliveryDiscountAmount,
-                oldTotal: currentTotal,
-                newTotal,
-                cashCollected: dto.cashCollected,
-                newPaid,
-                newBalance,
-                collectedBy: dto.collectedBy || null,
-            };
-        },
-        {
-            timeout: 30000,
-            maxWait: 15000,
-        }
-    );
-}
+                return {
+                    message:
+                        advancePortion > 0
+                            ? `Cheque recorded — Rs ${allocatedToInvoices.toFixed(
+                                2
+                            )} settled across ${allocations.length
+                            } invoice(s), Rs ${advancePortion.toFixed(
+                                2
+                            )} held as pending advance`
+                            : `Cheque recorded — Rs ${allocatedToInvoices.toFixed(
+                                2
+                            )} settled across ${allocations.length} invoice(s)`,
+                    chequeNumber: dto.chequeNumber,
+                    totalAmount: dto.amount,
+                    allocatedToInvoices,
+                    advancePortion,
+                    invoiceCount: allocations.length,
+                    payments: createdPayments,
+                    status: 'pending',
+                };
+            },
+            { timeout: 30000, maxWait: 15000 }
+        );
+    }
 
 
 }

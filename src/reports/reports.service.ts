@@ -17,6 +17,7 @@ interface DateFilterOptions {
     startDate?: Date;
     endDate?: Date;
     paymentMode?: string;
+    includeCancelled?: boolean;
 }
 
 interface PDFResult {
@@ -253,9 +254,9 @@ export class ReportsService {
             Brand: product.Brand || '-',
             Quantity: product.StockQty,
             Unit: product.Unit,
-            'Cost Price (LKR)': Number(product.CostPrice).toFixed(2),
-            'Selling Price (LKR)': Number(product.Price).toFixed(2),
-            'Total Value (LKR)': Number(product.Amount).toFixed(2),
+            'Cost Price (LKR)': Number(product.CostPrice),
+            'Selling Price (LKR)': Number(product.Price),
+            'Total Value (LKR)': Number(product.Amount),
             'Reorder Level': product.ReorderLevel,
             Status: product.Status === 'LOW_STOCK' ? '⚠️ Low Stock' : '✅ OK',
         }));
@@ -538,21 +539,45 @@ export class ReportsService {
     async getSalesReport(filters: DateFilterOptions) {
         const where: Prisma.SalesWhereInput = {};
 
-        // ✅ Build CreatedAt filter properly
+        // Date range
         const createdAtFilter: Prisma.DateTimeFilter = {};
         if (filters.startDate) {
             createdAtFilter.gte = filters.startDate;
         }
-
         if (filters.endDate) {
             const end = new Date(filters.endDate);
             end.setUTCDate(end.getUTCDate() + 1);
-            createdAtFilter.lt = end;      // ✅ less-than, not less-than-or-equal
+            createdAtFilter.lt = end;
         }
-
         if (Object.keys(createdAtFilter).length > 0) {
             where.CreatedAt = createdAtFilter;
         }
+
+        // Payment mode
+        if (filters.paymentMode) {
+            where.paymentMode = filters.paymentMode;
+        }
+
+        // Exclude cancelled unless requested
+        if (!filters.includeCancelled) {
+            where.Status = { not: 4 };
+        }
+
+        // ✅ Exclude test customers (but keep walk-in sales with null CustomerId)
+        const testCustomerFilter: Prisma.SalesWhereInput = {
+            OR: [
+                { CustomerId: null },                          // walk-in sales
+                { Customers: { IsTestCustomer: false } },       // real customers only
+            ],
+        };
+
+        // Combine with existing where
+        if (where.AND) {
+            (where.AND as any[]).push(testCustomerFilter);
+        } else {
+            where.AND = [testCustomerFilter];
+        }
+
         const sales = await this.prisma.sales.findMany({
             where,
             include: {
@@ -581,6 +606,7 @@ export class ReportsService {
             CustomerId: sale.CustomerId,
             CustomerName: sale.Customers?.Name || 'Walk-in Customer',
             CustomerPhone: sale.Customers?.Phone || '',
+            Status: sale.Status,
             Items: sale.SaleItems.map((item) => ({
                 Name: item.Products.Name,
                 Quantity: item.Quantity,
@@ -603,9 +629,9 @@ export class ReportsService {
             Date: sale.CreatedAt.toLocaleString(),
             Customer: sale.CustomerName,
             'Phone': sale.CustomerPhone,
-            'Total Amount (LKR)': Number(sale.TotalAmount).toFixed(2),
-            'Paid Amount (LKR)': Number(sale.PaidAmount).toFixed(2),
-            'Balance (LKR)': Number(sale.BalanceAmount).toFixed(2),
+            'Total Amount (LKR)': Number(sale.TotalAmount),
+            'Paid Amount (LKR)': Number(sale.PaidAmount),
+            'Balance (LKR)': Number(sale.BalanceAmount),
             'Payment Mode': sale.PaymentMode.toUpperCase(),
             'Credit Sale': sale.IsCreditSale ? 'Yes' : 'No',
             'Items': sale.TotalItems,
@@ -1018,3 +1044,4 @@ export class ReportsService {
         };
     }
 }
+
