@@ -229,7 +229,7 @@ model SaleItems {
   UnitPrice Decimal  @db.Decimal
   Total     Decimal  @db.Decimal
   Discount  Decimal  @default(0.0) @db.Decimal
-  Products  Products @relation(fields: [ProductId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_SaleItems_Products_ProductId")
+  Products  Products @relation(fields: [ProductId], references: [Id], onDelete: Restrict, onUpdate: NoAction, map: "FK_SaleItems_Products_ProductId")
   Sales     Sales    @relation(fields: [SaleId], references: [Id], onDelete: Cascade, onUpdate: NoAction, map: "FK_SaleItems_Sales_SaleId")
 
   @@index([ProductId], map: "IX_SaleItems_ProductId")
