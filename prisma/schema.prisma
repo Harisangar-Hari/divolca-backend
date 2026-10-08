@@ -322,6 +322,7 @@ model Suppliers {
   Address   String?
   CreatedAt DateTime    @db.Timestamptz(6)
   Purchases Purchases[]
+  IsTestSupplier Boolean  @default(false)
   AdvanceBalance Decimal @default(0.0) @db.Decimal   // ✅ we overpaid; supplier owes us
   PendingAdvance Decimal @default(0.0) @db.Decimal   // ✅ from pending cheques
   SupplierPayments SupplierPayments[]                // ✅ relation

@@ -704,40 +704,44 @@ export class ReportsService {
     async getPurchaseReport(filters: DateFilterOptions) {
         const where: Prisma.PurchasesWhereInput = {};
 
-        // ✅ Build PurchaseDate filter properly
         const purchaseDateFilter: Prisma.DateTimeFilter = {};
-
-        if (filters.startDate) {
-            purchaseDateFilter.gte = filters.startDate;
-        }
-
+        if (filters.startDate) purchaseDateFilter.gte = filters.startDate;
         if (filters.endDate) {
-            purchaseDateFilter.lte = filters.endDate;
+            const end = new Date(filters.endDate);
+            end.setUTCDate(end.getUTCDate() + 1);
+            purchaseDateFilter.lt = end;
         }
-
         if (Object.keys(purchaseDateFilter).length > 0) {
             where.PurchaseDate = purchaseDateFilter;
+        }
+
+        // ✅ Exclude cancelled purchases
+        where.Status = { not: 3 };
+
+        // ✅ Exclude test suppliers (from earlier)
+        const testSupplierFilter: Prisma.PurchasesWhereInput = {
+            Suppliers: { IsTestSupplier: false },
+        };
+        if (where.AND) {
+            (where.AND as any[]).push(testSupplierFilter);
+        } else {
+            where.AND = [testSupplierFilter];
         }
 
         const purchases = await this.prisma.purchases.findMany({
             where,
             include: {
                 Suppliers: true,
-                PurchaseItems: {
-                    include: {
-                        Products: true,
-                    },
-                },
+                PurchaseItems: { include: { Products: true } },
             },
-            orderBy: {
-                PurchaseDate: 'desc',
-            },
+            orderBy: { PurchaseDate: 'desc' },
         });
 
         return purchases.map((purchase) => ({
             Id: purchase.Id,
             InvoiceNumber: purchase.InvoiceNumber,
             PurchaseDate: purchase.PurchaseDate,
+            PurchaseNumber: purchase.PurchaseNumber,
             GrandTotal: purchase.GrandTotal,
             PaidAmount: purchase.PaidAmount,
             BalanceAmount: purchase.BalanceAmount,
@@ -752,7 +756,6 @@ export class ReportsService {
             TotalItems: purchase.PurchaseItems.length,
         }));
     }
-
     // ============================
     // PROFIT & LOSS REPORT
     // ============================
